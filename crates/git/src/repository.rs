@@ -701,6 +701,7 @@ pub enum LogSource {
     #[default]
     All,
     Branch(SharedString),
+    Branches(Vec<SharedString>),
     Sha(Oid),
     Path(RepoPath),
     Filtered {
@@ -716,6 +717,62 @@ pub struct GraphLogOptions {
     pub show_remote_branches: bool,
     pub include_reflog_commits: bool,
     pub first_parent_only: bool,
+}
+
+impl LogSource {
+    pub fn with_graph_options(self, options: GraphLogOptions) -> Self {
+        let source = match self {
+            LogSource::Filtered { source, .. } => *source,
+            source => source,
+        };
+
+        if options == GraphLogOptions::default() {
+            source
+        } else {
+            LogSource::Filtered {
+                source: Box::new(source),
+                options,
+            }
+        }
+    }
+
+    pub fn base_source(&self) -> &LogSource {
+        match self {
+            LogSource::Filtered { source, .. } => source.base_source(),
+            source => source,
+        }
+    }
+
+    fn get_args(&self) -> Vec<Cow<'_, str>> {
+        match self {
+            LogSource::All => vec![
+                Cow::Borrowed("--ignore-missing"), // needed in case of unborn HEAD
+                Cow::Borrowed("--branches"),
+                Cow::Borrowed("--remotes"),
+                Cow::Borrowed("--tags"),
+                Cow::Borrowed("refs/stash"),
+                Cow::Borrowed("HEAD"),
+            ],
+            LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
+            LogSource::Branches(branches) => {
+                if branches.is_empty() {
+                    vec![Cow::Borrowed("--max-count=0"), Cow::Borrowed("HEAD")]
+                } else {
+                    branches
+                        .iter()
+                        .map(|branch| Cow::Borrowed(branch.as_str()))
+                        .collect()
+                }
+            }
+            LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
+            LogSource::Path(path) => vec![
+                Cow::Borrowed("--follow"),
+                Cow::Borrowed("--"),
+                Cow::Borrowed(path.as_unix_str()),
+            ],
+            LogSource::Filtered { source, options } => options.get_args(source),
+        }
+    }
 }
 
 impl Default for GraphLogOptions {
@@ -759,52 +816,6 @@ impl GraphLogOptions {
                 args
             }
             source => source.get_args(),
-        }
-    }
-}
-
-impl LogSource {
-    pub fn base_source(&self) -> &LogSource {
-        match self {
-            LogSource::Filtered { source, .. } => source.base_source(),
-            source => source,
-        }
-    }
-
-    pub fn with_graph_options(self, options: GraphLogOptions) -> Self {
-        let source = match self {
-            LogSource::Filtered { source, .. } => *source,
-            source => source,
-        };
-
-        if options == GraphLogOptions::default() {
-            source
-        } else {
-            LogSource::Filtered {
-                source: Box::new(source),
-                options,
-            }
-        }
-    }
-
-    fn get_args(&self) -> Vec<Cow<'_, str>> {
-        match self {
-            LogSource::All => vec![
-                Cow::Borrowed("--ignore-missing"), // needed in case of unborn HEAD
-                Cow::Borrowed("--branches"),
-                Cow::Borrowed("--remotes"),
-                Cow::Borrowed("--tags"),
-                Cow::Borrowed("refs/stash"),
-                Cow::Borrowed("HEAD"),
-            ],
-            LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
-            LogSource::Sha(oid) => vec![Cow::Owned(oid.to_string())],
-            LogSource::Path(path) => vec![
-                Cow::Borrowed("--follow"),
-                Cow::Borrowed("--"),
-                Cow::Borrowed(path.as_unix_str()),
-            ],
-            LogSource::Filtered { source, options } => options.get_args(source),
         }
     }
 }
@@ -4643,6 +4654,61 @@ mod tests {
         };
 
         assert_eq!(commit.tag_names(), ["v1.0.0", "v1.1.0"]);
+    }
+
+    #[test]
+    fn test_graph_log_options_filter_all_source_args() {
+        let source = LogSource::All.with_graph_options(GraphLogOptions {
+            show_stashes: false,
+            show_tags: false,
+            show_remote_branches: false,
+            include_reflog_commits: true,
+            first_parent_only: true,
+        });
+
+        assert_eq!(
+            source.get_args(),
+            vec![
+                Cow::Borrowed("--reflog"),
+                Cow::Borrowed("--first-parent"),
+                Cow::Borrowed("--ignore-missing"),
+                Cow::Borrowed("--branches"),
+                Cow::Borrowed("HEAD"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_log_source_includes_stash_without_custom_refs() {
+        assert_eq!(
+            LogSource::All.get_args(),
+            vec![
+                Cow::Borrowed("--ignore-missing"),
+                Cow::Borrowed("--branches"),
+                Cow::Borrowed("--remotes"),
+                Cow::Borrowed("--tags"),
+                Cow::Borrowed("refs/stash"),
+                Cow::Borrowed("HEAD"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_branches_log_source_uses_selected_refs() {
+        assert_eq!(
+            LogSource::Branches(vec![
+                "refs/heads/main".into(),
+                "refs/remotes/origin/main".into()
+            ])
+            .get_args()
+            .unwrap(),
+            vec!["refs/heads/main", "refs/remotes/origin/main"]
+        );
+
+        assert_eq!(
+            LogSource::Branches(Vec::new()).get_args().unwrap(),
+            vec!["--max-count=0", "HEAD"]
+        );
     }
 
     #[test]
