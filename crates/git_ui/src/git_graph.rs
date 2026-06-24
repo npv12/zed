@@ -5,13 +5,16 @@ use crate::{
     commit_view::CommitView,
     git_status_icon,
 };
-use collections::{BTreeMap, HashMap, IndexSet};
+use collections::{BTreeMap, HashMap, HashSet, IndexSet};
 use editor::Editor;
 use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{GraphLogOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
+    repository::{
+        Branch, GraphLogOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
+        SearchCommitArgs,
+    },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
@@ -25,7 +28,7 @@ use gpui::{
 use language::line_diff;
 use markdown::{Markdown, MarkdownElement};
 use menu::{Cancel, SelectFirst, SelectLast, SelectNext, SelectPrevious};
-use picker::{Picker, PickerDelegate};
+use picker::{Picker, PickerDelegate, PickerEditorPosition, popover_menu::PickerPopoverMenu};
 use project::{
     ProjectPath,
     git_store::{
@@ -49,17 +52,20 @@ use zed_actions::{
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
-    Checkbox, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu,
-    PopoverMenuHandle, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
-    prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
-    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
+    ButtonLike, Checkbox, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat,
+    Divider, HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
+    PopoverMenu, PopoverMenuHandle, RedistributableColumnsState, ScrollableHandle, Table,
+    TableInteractionState, TableRenderContext, TableResizeBehavior, ToggleState, Tooltip,
+    WithScrollbar, bind_redistributable_columns, prelude::*, redistribute_hidden_fractions,
+    redistribute_hidden_widths, render_redistributable_columns_resize_handles, render_table_header,
+    table_row::TableRow,
 };
+use ui_input::ErasedEditor;
 use util::{ResultExt, debug_panic};
 use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::DetachAndPromptErr,
 };
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
@@ -531,6 +537,91 @@ struct SearchState {
     selected_index: Option<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchInfo {
+    ref_name: SharedString,
+    is_head: bool,
+    is_remote: bool,
+    is_selected: bool,
+}
+
+#[derive(Default)]
+struct BranchFilterState {
+    handle: PopoverMenuHandle<Picker<BranchFilterPickerDelegate>>,
+    available_branches: Vec<BranchInfo>,
+    selected_branches: HashSet<SharedString>,
+    query: SharedString,
+    branches_loaded: bool,
+    is_loading: bool,
+}
+
+#[derive(Clone)]
+enum BranchFilterEntry {
+    Branch(SharedString),
+}
+
+struct BranchFilterPickerDelegate {
+    graph: Option<WeakEntity<GitGraph>>,
+    query: String,
+    matches: Vec<BranchFilterEntry>,
+    selected_index: usize,
+}
+
+impl BranchFilterPickerDelegate {
+    fn new() -> Self {
+        Self {
+            graph: None,
+            query: String::new(),
+            matches: Vec::new(),
+            selected_index: 0,
+        }
+    }
+
+    fn recompute_matches(&mut self, cx: &App) {
+        let matches = self
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.upgrade())
+            .map_or_else(Vec::new, |graph| {
+                graph.read_with(cx, |graph, _| graph.branch_filter_entries(&self.query))
+            });
+        self.set_matches(matches);
+    }
+
+    fn set_matches(&mut self, matches: Vec<BranchFilterEntry>) {
+        self.matches = matches;
+        if self.matches.is_empty() {
+            self.selected_index = 0;
+        } else {
+            self.selected_index = self.selected_index.min(self.matches.len() - 1);
+        }
+    }
+
+    fn render_checkbox_label(
+        checkbox_id: impl Into<ElementId>,
+        toggle_state: ToggleState,
+        label: impl Into<SharedString>,
+    ) -> Div {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div()
+                    .flex_none()
+                    .child(Checkbox::new(checkbox_id, toggle_state).visualization_only(true)),
+            )
+            .child(
+                Label::new(label)
+                    .color(Color::Default)
+                    .size(LabelSize::Small)
+                    .single_line()
+                    .truncate()
+                    .flex_1(),
+            )
+    }
+}
+
 impl SearchState {
     fn clear_results(&mut self) {
         self.matches.clear();
@@ -627,6 +718,18 @@ actions!(
         Open,
         /// Focuses the search field.
         FocusSearch,
+        /// Toggles the branch filter picker.
+        ToggleBranchFilter,
+        /// Toggles whether stash commits are shown in the git graph.
+        ToggleShowStashes,
+        /// Toggles whether tags are shown in the git graph.
+        ToggleShowTags,
+        /// Toggles whether remote branches are shown in the git graph.
+        ToggleShowRemoteBranches,
+        /// Toggles whether reflog commits are included in the git graph.
+        ToggleReflogCommits,
+        /// Toggles whether only first-parent history is shown in the git graph.
+        ToggleFirstParentOnly,
         /// Focuses the next git graph tab stop.
         FocusNextTabStop,
         /// Focuses the previous git graph tab stop.
@@ -639,16 +742,6 @@ actions!(
         ToggleChangedFilesView,
         /// Toggles filtering the graph to commits matching the search query.
         ToggleSearchFilter,
-        /// Toggles whether stash commits are shown in the git graph.
-        ToggleShowStashes,
-        /// Toggles whether tags are shown in the git graph.
-        ToggleShowTags,
-        /// Toggles whether remote branches are shown in the git graph.
-        ToggleShowRemoteBranches,
-        /// Toggles whether reflog commits are included in the git graph.
-        ToggleReflogCommits,
-        /// Toggles whether only first-parent history is shown in the git graph.
-        ToggleFirstParentOnly,
     ]
 );
 
@@ -1364,6 +1457,9 @@ struct DetailPanelCommitMessage {
 pub struct GitGraph {
     focus_handle: FocusHandle,
     search_state: SearchState,
+    settings_dropdown_state: SettingsDropdownState,
+    branch_filter_state: BranchFilterState,
+    branch_filter_picker: Option<Entity<Picker<BranchFilterPickerDelegate>>>,
     graph_data: GraphData,
     git_store: Entity<GitStore>,
     workspace: WeakEntity<Workspace>,
@@ -1389,7 +1485,6 @@ pub struct GitGraph {
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
-    settings_dropdown_state: SettingsDropdownState,
 }
 
 impl GitGraph {
@@ -1408,6 +1503,9 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) {
         let mut settings = self.settings_dropdown_state.settings;
+        let old_show_remote_branches = settings.show_remote_branches;
+        let previously_all_eligible_selected = self.all_branches_selected();
+        let previous_selection = self.branch_filter_state.selected_branches.clone();
         update(&mut settings);
 
         if settings == self.settings_dropdown_state.settings {
@@ -1415,39 +1513,22 @@ impl GitGraph {
         }
 
         self.settings_dropdown_state.settings = settings;
-        self.log_source = self.log_source.clone().with_graph_options(settings);
-        self.pending_select_sha = None;
-        self.invalidate_state(cx);
-        self.fetch_initial_graph_data(cx);
-    }
-
-    fn is_visible_ref_name(&self, ref_name: &str) -> bool {
-        if !self.settings_dropdown_state.settings.show_tags
-            && (ref_name.starts_with("tag: ") || ref_name.starts_with("refs/tags/"))
+        if old_show_remote_branches != settings.show_remote_branches
+            && self.branch_filter_state.branches_loaded
         {
-            return false;
+            self.reconcile_available_branch_selection(
+                true,
+                previously_all_eligible_selected,
+                &previous_selection,
+            );
+            self.apply_branch_filter_source(cx);
+            self.refresh_branch_filter_picker(cx);
+        } else {
+            self.log_source = self.log_source.clone().with_graph_options(settings);
+            self.pending_select_sha = None;
+            self.invalidate_state(cx);
+            self.fetch_initial_graph_data(cx);
         }
-
-        if !self.settings_dropdown_state.settings.show_remote_branches
-            && Self::is_remote_branch_ref_name(ref_name)
-        {
-            return false;
-        }
-
-        if !self.settings_dropdown_state.settings.show_stashes
-            && (ref_name == "refs/stash"
-                || ref_name == "stash"
-                || ref_name.starts_with("stash@{")
-                || ref_name.contains("refs/stash"))
-        {
-            return false;
-        }
-
-        true
-    }
-
-    fn is_remote_branch_ref_name(ref_name: &str) -> bool {
-        ref_name.starts_with("refs/remotes/")
     }
 
     /// Computes the height of a single commit row in the git graph.
@@ -1595,9 +1676,11 @@ impl GitGraph {
 
         let accent_colors = cx.theme().accents();
         let graph = GraphData::new(accent_colors_count(accent_colors));
-        let base_log_source = log_source.unwrap_or_default();
-        let settings = GraphLogOptions::default();
-        let log_source = base_log_source.with_graph_options(settings);
+        let settings_dropdown_state = SettingsDropdownState::default();
+        let branch_filter_state = BranchFilterState::default();
+        let log_source = log_source
+            .unwrap_or_default()
+            .with_graph_options(settings_dropdown_state.settings.into());
         let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
@@ -1701,6 +1784,9 @@ impl GitGraph {
                 selected_index: None,
                 state: QueryState::Empty,
             },
+            settings_dropdown_state,
+            branch_filter_state,
+            branch_filter_picker: None,
             workspace,
             graph_data: graph,
             _commit_diff_task: None,
@@ -1723,7 +1809,6 @@ impl GitGraph {
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
-            settings_dropdown_state: SettingsDropdownState::default(),
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1849,9 +1934,493 @@ impl GitGraph {
         }
     }
 
+    fn is_visible_ref_name(&self, ref_name: &str) -> bool {
+        if !self.settings_dropdown_state.settings.show_tags
+            && (ref_name.starts_with("tag: ") || ref_name.starts_with("refs/tags/"))
+        {
+            return false;
+        }
+
+        if !self.settings_dropdown_state.settings.show_remote_branches
+            && !Self::ref_name_matches_remote_visibility(
+                false,
+                &self.branch_filter_state.available_branches,
+                ref_name,
+            )
+        {
+            return false;
+        }
+
+        if !self.settings_dropdown_state.settings.show_stashes
+            && (ref_name == "refs/stash"
+                || ref_name == "stash"
+                || ref_name.starts_with("stash@{")
+                || ref_name.contains("refs/stash"))
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn is_stash_ref_name(ref_name: &str) -> bool {
+        ref_name == "refs/stash" || ref_name == "stash" || ref_name.starts_with("stash@{")
+    }
+
+    fn is_remote_branch_ref_name(ref_name: &str) -> bool {
+        ref_name.starts_with("refs/remotes/")
+    }
+
+    fn branch_display_name(ref_name: &str) -> SharedString {
+        ref_name
+            .strip_prefix("refs/heads/")
+            .or_else(|| ref_name.strip_prefix("refs/remotes/"))
+            .unwrap_or(ref_name)
+            .to_string()
+            .into()
+    }
+
+    fn eligible_branch_infos(&self) -> Vec<&BranchInfo> {
+        let show_remote_branches = self.settings_dropdown_state.settings.show_remote_branches;
+        self.branch_filter_state
+            .available_branches
+            .iter()
+            .filter(|branch| show_remote_branches || !branch.is_remote)
+            .collect()
+    }
+
+    fn matching_branch_infos(&self, query: &str) -> Vec<&BranchInfo> {
+        let query = query.to_lowercase();
+        self.eligible_branch_infos()
+            .into_iter()
+            .filter(|branch| {
+                query.is_empty()
+                    || Self::branch_display_name(branch.ref_name.as_ref())
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect()
+    }
+
+    fn branch_filter_entries(&self, query: &str) -> Vec<BranchFilterEntry> {
+        self.matching_branch_infos(query)
+            .into_iter()
+            .map(|branch| BranchFilterEntry::Branch(branch.ref_name.clone()))
+            .collect()
+    }
+
+    fn all_branches_selection_state(&self) -> ToggleState {
+        Self::branch_selection_state_for_state(
+            self.branch_filter_state.branches_loaded,
+            self.settings_dropdown_state.settings.show_remote_branches,
+            &self.branch_filter_state.available_branches,
+            &self.branch_filter_state.selected_branches,
+        )
+    }
+
+    fn branch_selection_state_for_state(
+        branches_loaded: bool,
+        show_remote_branches: bool,
+        available_branches: &[BranchInfo],
+        selected_branches: &HashSet<SharedString>,
+    ) -> ToggleState {
+        if !branches_loaded {
+            return ToggleState::Selected;
+        }
+
+        let eligible_branches = available_branches
+            .iter()
+            .filter(|branch| show_remote_branches || !branch.is_remote)
+            .collect::<Vec<_>>();
+        if eligible_branches.is_empty() {
+            return ToggleState::Unselected;
+        }
+
+        let selected_count = eligible_branches
+            .iter()
+            .filter(|branch| selected_branches.contains(&branch.ref_name))
+            .count();
+
+        if selected_count == 0 {
+            ToggleState::Unselected
+        } else if selected_count == eligible_branches.len() {
+            ToggleState::Selected
+        } else {
+            ToggleState::Indeterminate
+        }
+    }
+
+    fn all_branches_selected(&self) -> bool {
+        self.all_branches_selection_state() == ToggleState::Selected
+    }
+
+    fn set_all_branch_selection(&mut self, selected: bool, cx: &mut Context<Self>) {
+        if selected {
+            self.branch_filter_state.selected_branches = self
+                .eligible_branch_infos()
+                .into_iter()
+                .map(|branch| branch.ref_name.clone())
+                .collect();
+        } else {
+            self.branch_filter_state.selected_branches.clear();
+        }
+
+        self.sync_branch_filter_selection();
+        self.apply_branch_filter_source(cx);
+        self.refresh_branch_filter_picker(cx);
+    }
+
+    fn sort_available_branches(available_branches: &mut [BranchInfo]) {
+        available_branches.sort_by(|left, right| {
+            right.is_head.cmp(&left.is_head).then_with(|| {
+                left.is_remote.cmp(&right.is_remote).then_with(|| {
+                    Self::branch_display_name(left.ref_name.as_ref())
+                        .as_ref()
+                        .cmp(Self::branch_display_name(right.ref_name.as_ref()).as_ref())
+                })
+            })
+        });
+    }
+
+    fn build_available_branches(branches: Vec<Branch>) -> Vec<BranchInfo> {
+        let mut available_branches = branches
+            .into_iter()
+            .map(|branch| BranchInfo {
+                ref_name: branch.ref_name.clone(),
+                is_head: branch.is_head,
+                is_remote: branch.is_remote(),
+                is_selected: false,
+            })
+            .collect::<Vec<_>>();
+        Self::sort_available_branches(&mut available_branches);
+        available_branches
+    }
+
+    fn branch_info_from_graph_ref(ref_name: &str) -> Option<BranchInfo> {
+        let (ref_name, is_head) = ref_name
+            .strip_prefix("HEAD -> ")
+            .map_or((ref_name, false), |ref_name| (ref_name, true));
+
+        if ref_name.is_empty()
+            || ref_name == "HEAD"
+            || ref_name.starts_with("tag: ")
+            || ref_name.starts_with("refs/tags/")
+            || Self::is_stash_ref_name(ref_name)
+        {
+            return None;
+        }
+
+        let (ref_name, is_remote) = if ref_name.starts_with("refs/heads/") {
+            (ref_name.to_string(), false)
+        } else if ref_name.starts_with("refs/remotes/") {
+            (ref_name.to_string(), true)
+        } else if ref_name
+            .split_once('/')
+            .is_some_and(|(remote_name, _)| remote_name == "origin" || remote_name == "upstream")
+        {
+            (format!("refs/remotes/{ref_name}"), true)
+        } else {
+            (format!("refs/heads/{ref_name}"), false)
+        };
+
+        Some(BranchInfo {
+            ref_name: ref_name.into(),
+            is_head,
+            is_remote,
+            is_selected: false,
+        })
+    }
+
+    fn build_available_branches_from_graph_refs(&self) -> Vec<BranchInfo> {
+        let mut branches_by_ref_name = HashMap::default();
+        for commit in &self.graph_data.commits {
+            for ref_name in &commit.data.ref_names {
+                let Some(branch) = Self::branch_info_from_graph_ref(ref_name.as_ref()) else {
+                    continue;
+                };
+                branches_by_ref_name
+                    .entry(branch.ref_name.clone())
+                    .and_modify(|existing_branch: &mut BranchInfo| {
+                        existing_branch.is_head |= branch.is_head;
+                    })
+                    .or_insert(branch);
+            }
+        }
+
+        let mut available_branches = branches_by_ref_name.into_values().collect::<Vec<_>>();
+        Self::sort_available_branches(&mut available_branches);
+        available_branches
+    }
+
+    fn eligible_ref_names(
+        branches: &[BranchInfo],
+        show_remote_branches: bool,
+    ) -> HashSet<SharedString> {
+        branches
+            .iter()
+            .filter(|branch| show_remote_branches || !branch.is_remote)
+            .map(|branch| branch.ref_name.clone())
+            .collect()
+    }
+
+    fn reconcile_branch_selection(
+        branches_were_loaded: bool,
+        previously_all_eligible_selected: bool,
+        previous_selection: &HashSet<SharedString>,
+        eligible_ref_names: &HashSet<SharedString>,
+    ) -> HashSet<SharedString> {
+        if !branches_were_loaded || previously_all_eligible_selected {
+            eligible_ref_names.clone()
+        } else {
+            previous_selection
+                .iter()
+                .filter(|branch| eligible_ref_names.contains(*branch))
+                .cloned()
+                .collect()
+        }
+    }
+
+    fn reconcile_available_branch_selection(
+        &mut self,
+        branches_were_loaded: bool,
+        previously_all_eligible_selected: bool,
+        previous_selection: &HashSet<SharedString>,
+    ) {
+        let eligible_ref_names = Self::eligible_ref_names(
+            &self.branch_filter_state.available_branches,
+            self.settings_dropdown_state.settings.show_remote_branches,
+        );
+        self.branch_filter_state.selected_branches = Self::reconcile_branch_selection(
+            branches_were_loaded,
+            previously_all_eligible_selected,
+            previous_selection,
+            &eligible_ref_names,
+        );
+        self.sync_branch_filter_selection();
+    }
+
+    fn sync_branch_filter_selection(&mut self) {
+        for branch in &mut self.branch_filter_state.available_branches {
+            branch.is_selected = self
+                .branch_filter_state
+                .selected_branches
+                .contains(&branch.ref_name);
+        }
+    }
+
+    fn branch_filter_source_for_state(
+        branches_loaded: bool,
+        show_remote_branches: bool,
+        available_branches: &[BranchInfo],
+        selected_branches: &HashSet<SharedString>,
+    ) -> LogSource {
+        if !branches_loaded {
+            return LogSource::All;
+        }
+
+        let eligible_branches = available_branches
+            .iter()
+            .filter(|branch| show_remote_branches || !branch.is_remote)
+            .collect::<Vec<_>>();
+
+        let mut selected_eligible_branches = eligible_branches
+            .iter()
+            .filter(|branch| selected_branches.contains(&branch.ref_name))
+            .map(|branch| branch.ref_name.clone())
+            .collect::<Vec<_>>();
+
+        if selected_eligible_branches.is_empty() {
+            return LogSource::Branches(Vec::new());
+        }
+
+        selected_eligible_branches
+            .sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+
+        if show_remote_branches && selected_eligible_branches.len() == eligible_branches.len() {
+            LogSource::All
+        } else {
+            LogSource::Branches(selected_eligible_branches)
+        }
+    }
+
+    fn branch_filter_source(&self) -> LogSource {
+        Self::branch_filter_source_for_state(
+            self.branch_filter_state.branches_loaded,
+            self.settings_dropdown_state.settings.show_remote_branches,
+            &self.branch_filter_state.available_branches,
+            &self.branch_filter_state.selected_branches,
+        )
+    }
+
+    fn apply_branch_filter_source(&mut self, cx: &mut Context<Self>) {
+        let new_log_source = self
+            .branch_filter_source()
+            .with_graph_options(self.settings_dropdown_state.settings.into());
+
+        if new_log_source == self.log_source {
+            cx.notify();
+            return;
+        }
+
+        self.log_source = new_log_source;
+        self.pending_select_sha = None;
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
+    fn load_available_branches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branch_filter_state.is_loading {
+            return;
+        }
+
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let branches_were_loaded = self.branch_filter_state.branches_loaded;
+        let previous_selection = self.branch_filter_state.selected_branches.clone();
+        let previously_all_eligible_selected = self.all_branches_selected();
+        self.branch_filter_state.is_loading = true;
+        self.refresh_branch_filter_picker(cx);
+        let receiver = repository.update(cx, |repository, _| repository.branches());
+
+        cx.spawn_in(window, async move |this, cx| {
+            let branches = receiver
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+
+            this.update_in(cx, |this, _window, cx| {
+                let use_graph_refs = branches.error.is_some() || branches.branches.is_empty();
+                let mut available_branches = Self::build_available_branches(branches.branches);
+                if use_graph_refs {
+                    for branch in this.build_available_branches_from_graph_refs() {
+                        if !available_branches
+                            .iter()
+                            .any(|available_branch| available_branch.ref_name == branch.ref_name)
+                        {
+                            available_branches.push(branch);
+                        }
+                    }
+                    Self::sort_available_branches(&mut available_branches);
+                }
+                this.branch_filter_state.available_branches = available_branches;
+                this.branch_filter_state.branches_loaded = true;
+                this.branch_filter_state.is_loading = false;
+                this.reconcile_available_branch_selection(
+                    branches_were_loaded,
+                    previously_all_eligible_selected,
+                    &previous_selection,
+                );
+                this.apply_branch_filter_source(cx);
+                this.refresh_branch_filter_picker(cx);
+            })?;
+
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to load branches", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+    }
+
+    fn refresh_branch_filter_picker(&mut self, cx: &mut Context<Self>) {
+        let matches = self.branch_filter_entries(self.branch_filter_state.query.as_ref());
+        if let Some(picker) = &self.branch_filter_picker {
+            picker.update(cx, |picker, cx| {
+                picker.delegate.set_matches(matches);
+                cx.notify();
+            });
+        }
+    }
+
+    fn toggle_branch_selection(
+        &mut self,
+        ref_name: SharedString,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .branch_filter_state
+            .selected_branches
+            .contains(&ref_name)
+        {
+            self.branch_filter_state.selected_branches.remove(&ref_name);
+        } else {
+            self.branch_filter_state.selected_branches.insert(ref_name);
+        }
+
+        self.sync_branch_filter_selection();
+        self.apply_branch_filter_source(cx);
+        self.refresh_branch_filter_picker(cx);
+    }
+
+    fn open_branch_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picker = self.ensure_branch_filter_picker(window, cx);
+        if !self.branch_filter_state.branches_loaded {
+            self.load_available_branches(window, cx);
+        }
+
+        if self.branch_filter_state.handle.is_deployed() {
+            self.branch_filter_state.handle.hide(cx);
+        } else {
+            self.branch_filter_state.handle.show(window, cx);
+            picker.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    fn ref_name_matches_remote_visibility(
+        show_remote_branches: bool,
+        available_branches: &[BranchInfo],
+        ref_name: &str,
+    ) -> bool {
+        if show_remote_branches {
+            return true;
+        }
+
+        if Self::is_remote_branch_ref_name(ref_name) {
+            return false;
+        }
+
+        !available_branches
+            .iter()
+            .filter(|branch| branch.is_remote)
+            .map(|branch| Self::branch_display_name(branch.ref_name.as_ref()))
+            .any(|display_name| {
+                ref_name == display_name.as_ref()
+                    || ref_name
+                        .strip_prefix("HEAD -> ")
+                        .is_some_and(|name| name == display_name.as_ref())
+            })
+    }
+
     fn get_repository(&self, cx: &App) -> Option<Entity<Repository>> {
         let git_store = self.git_store.read(cx);
         git_store.repositories().get(&self.repo_id).cloned()
+    }
+
+    fn ensure_branch_filter_picker(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Picker<BranchFilterPickerDelegate>> {
+        if let Some(picker) = &self.branch_filter_picker {
+            return picker.clone();
+        }
+
+        let weak_graph = cx.weak_entity();
+        let query = self.branch_filter_state.query.to_string();
+        let matches = self.branch_filter_entries(&query);
+        let picker = cx.new(|cx| {
+            let mut delegate = BranchFilterPickerDelegate::new();
+            delegate.graph = Some(weak_graph);
+            delegate.query = query;
+            delegate.set_matches(matches);
+            Picker::uniform_list(delegate, window, cx)
+                .initial_width(rems(24.))
+                .max_height(rems(28.))
+                .show_scrollbar(true)
+        });
+        self.branch_filter_picker = Some(picker.clone());
+        picker
     }
 
     /// Checks whether a ref name from git's `%D` decoration
@@ -2802,7 +3371,80 @@ impl GitGraph {
         self.set_context_menu(context_menu, position, None, window, cx);
     }
 
-    fn render_search_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_branch_filter_button(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let eligible_branches = self.eligible_branch_infos();
+        let selected_eligible = eligible_branches
+            .iter()
+            .filter(|branch| {
+                self.branch_filter_state
+                    .selected_branches
+                    .contains(&branch.ref_name)
+            })
+            .count();
+
+        let label = if !self.branch_filter_state.branches_loaded || self.all_branches_selected() {
+            "Branch".to_string()
+        } else if selected_eligible == 1 {
+            eligible_branches
+                .iter()
+                .find(|branch| {
+                    self.branch_filter_state
+                        .selected_branches
+                        .contains(&branch.ref_name)
+                })
+                .map(|branch| Self::branch_display_name(branch.ref_name.as_ref()).to_string())
+                .unwrap_or_else(|| "Branch".to_string())
+        } else {
+            format!("{selected_eligible} branches")
+        };
+
+        let weak = cx.weak_entity();
+        let picker = self.ensure_branch_filter_picker(window, cx);
+        PickerPopoverMenu::new(
+            picker,
+            ButtonLike::new("toggle-git-graph-branch-filter")
+                .style(ButtonStyle::Subtle)
+                .child(
+                    h_flex()
+                        .debug_selector(|| "git-graph-branch-filter-trigger".into())
+                        .max_w(rems(18.))
+                        .min_w_0()
+                        .gap_1()
+                        .items_center()
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            if let Some(graph) = weak.upgrade() {
+                                graph.update(cx, |graph, cx| {
+                                    if !graph.branch_filter_state.branches_loaded {
+                                        graph.load_available_branches(window, cx);
+                                    }
+                                });
+                            }
+                        })
+                        .child(Label::new(label).single_line().truncate().flex_1())
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(Icon::new(IconName::ChevronDown).size(IconSize::Small)),
+                        ),
+                ),
+            Tooltip::text("Filter branches"),
+            Anchor::TopRight,
+            cx,
+        )
+        .with_handle(self.branch_filter_state.handle.clone())
+        .render(window, cx)
+        .into_any_element()
+    }
+
+    fn render_search_bar(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let color = cx.theme().colors();
         let query_focus_handle = self
             .search_state
@@ -2859,6 +3501,7 @@ impl GitGraph {
                             })
                     }),
             )
+            .child(self.render_branch_filter_button(window, cx))
             .child({
                 let filter_state = self.search_state.filter_matches;
                 let show_stashes = self.settings_dropdown_state.settings.show_stashes;
@@ -4147,6 +4790,207 @@ impl GitGraph {
     }
 }
 
+impl PickerDelegate for BranchFilterPickerDelegate {
+    type ListItem = ListItem;
+
+    fn name() -> &'static str {
+        "git-graph-branch-filter"
+    }
+
+    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
+        "Filter branches...".into()
+    }
+
+    fn no_matches_text(&self, _window: &mut Window, cx: &mut App) -> Option<SharedString> {
+        self.graph
+            .as_ref()
+            .and_then(|graph| graph.upgrade())
+            .map(|graph| {
+                graph.read_with(cx, |graph, _| {
+                    if graph.branch_filter_state.is_loading {
+                        "Loading branches...".into()
+                    } else {
+                        "No matching branches".into()
+                    }
+                })
+            })
+    }
+
+    fn match_count(&self) -> usize {
+        self.matches.len()
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+
+    fn set_selected_index(
+        &mut self,
+        index: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) {
+        self.selected_index = index;
+    }
+
+    fn update_matches(
+        &mut self,
+        query: String,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        if let Some(graph) = self.graph.as_ref().and_then(|graph| graph.upgrade()) {
+            if self.query == query {
+                return Task::ready(());
+            }
+
+            let query_for_graph = SharedString::from(query.clone());
+            graph.update(cx, |graph, _| {
+                graph.branch_filter_state.query = query_for_graph;
+            });
+        }
+        self.query = query;
+        self.recompute_matches(cx);
+        Task::ready(())
+    }
+
+    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(BranchFilterEntry::Branch(ref_name)) =
+            self.matches.get(self.selected_index).cloned()
+        else {
+            return;
+        };
+
+        if let Some(graph) = self.graph.as_ref().and_then(|graph| graph.upgrade()) {
+            window.defer(cx, move |window, cx| {
+                graph.update(cx, |graph, cx| {
+                    graph.toggle_branch_selection(ref_name, window, cx);
+                });
+            });
+        }
+    }
+
+    fn dismissed(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        if let Some(graph) = self.graph.as_ref().and_then(|graph| graph.upgrade()) {
+            let graph = graph.downgrade();
+            window.defer(cx, move |_window, cx| {
+                if let Some(graph) = graph.upgrade() {
+                    graph.update(cx, |graph, cx| {
+                        graph.branch_filter_state.handle.hide(cx);
+                    });
+                }
+            });
+        }
+    }
+
+    fn editor_position(&self) -> PickerEditorPosition {
+        PickerEditorPosition::Start
+    }
+
+    fn render_editor(
+        &self,
+        editor: &Arc<dyn ErasedEditor>,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<Div> {
+        let editor = editor
+            .as_any()
+            .downcast_ref::<Entity<Editor>>()
+            .expect("branch filter picker should render an editor");
+
+        Some(
+            h_flex()
+                .overflow_hidden()
+                .flex_none()
+                .h_9()
+                .px_2p5()
+                .child(editor.clone()),
+        )
+    }
+
+    fn render_header(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        let graph = self.graph.as_ref().and_then(|graph| graph.upgrade())?;
+        let (is_loading, all_selection_state) = graph.read_with(cx, |graph, _| {
+            (
+                graph.branch_filter_state.is_loading,
+                graph.all_branches_selection_state(),
+            )
+        });
+
+        if is_loading {
+            return None;
+        }
+
+        let weak_graph = self.graph.clone();
+        Some(
+            v_flex()
+                .child(
+                    ListItem::new("git-graph-branch-filter-all")
+                        .inset(true)
+                        .spacing(ListItemSpacing::Sparse)
+                        .child(Self::render_checkbox_label(
+                            "git-graph-branch-filter-all-checkbox",
+                            all_selection_state,
+                            "Select All",
+                        ))
+                        .on_click(move |_, window, cx| {
+                            if let Some(graph) =
+                                weak_graph.as_ref().and_then(|graph| graph.upgrade())
+                            {
+                                graph.update(cx, |graph, cx| {
+                                    graph.set_all_branch_selection(
+                                        !graph.all_branches_selected(),
+                                        cx,
+                                    );
+                                });
+                            }
+                            window.prevent_default();
+                        }),
+                )
+                .child(Divider::horizontal())
+                .into_any_element(),
+        )
+    }
+
+    fn render_match(
+        &self,
+        index: usize,
+        selected: bool,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<Self::ListItem> {
+        let BranchFilterEntry::Branch(ref_name) = self.matches.get(index)?.clone();
+        let graph = self.graph.as_ref().and_then(|graph| graph.upgrade())?;
+        let (label, is_selected) = graph.read_with(cx, |graph, _| {
+            let branch = graph
+                .branch_filter_state
+                .available_branches
+                .iter()
+                .find(|branch| branch.ref_name == ref_name)?;
+            Some((
+                GitGraph::branch_display_name(branch.ref_name.as_ref()),
+                branch.is_selected,
+            ))
+        })?;
+
+        Some(
+            ListItem::new(("git-graph-branch-filter-entry", index))
+                .inset(true)
+                .spacing(ListItemSpacing::Sparse)
+                .toggle_state(selected)
+                .child(Self::render_checkbox_label(
+                    ("git-graph-branch-filter-checkbox", index),
+                    ToggleState::from(is_selected),
+                    label,
+                )),
+        )
+    }
+}
+
 impl Render for GitGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // This happens when we changed branches, we should refresh our search as well
@@ -4529,6 +5373,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::toggle_changed_files_view))
             .on_action(cx.listener(Self::toggle_search_filter))
+            .on_action(cx.listener(|this, _: &ToggleBranchFilter, window, cx| {
+                this.open_branch_filter(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleShowStashes, _window, cx| {
                 this.update_graph_settings(|settings| settings.show_stashes ^= true, cx);
             }))
@@ -4566,7 +5413,7 @@ impl Render for GitGraph {
             .child(
                 v_flex()
                     .size_full()
-                    .child(self.render_search_bar(cx))
+                    .child(self.render_search_bar(window, cx))
                     .child(div().flex_1().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
@@ -4905,7 +5752,7 @@ mod persistence {
 
     pub fn serialize_log_source_type(log_source: &LogSource) -> i32 {
         match log_source.base_source() {
-            LogSource::All => LOG_SOURCE_ALL,
+            LogSource::All | LogSource::Branches(_) => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
@@ -4915,7 +5762,7 @@ mod persistence {
 
     pub fn serialize_log_source_value(log_source: &LogSource) -> Option<String> {
         match log_source.base_source() {
-            LogSource::All => None,
+            LogSource::All | LogSource::Branches(_) => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
@@ -5213,6 +6060,7 @@ mod tests {
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             language_model::init(cx);
+            editor::init(cx);
             crate::init(cx);
         });
     }
@@ -5224,6 +6072,86 @@ mod tests {
             .enumerate()
             .map(|(idx, entry)| (entry.data.sha, idx))
             .collect()
+    }
+
+    fn branch_infos(ref_names: &[&str]) -> Vec<BranchInfo> {
+        ref_names
+            .iter()
+            .map(|ref_name| BranchInfo {
+                ref_name: SharedString::from(*ref_name),
+                is_head: *ref_name == "refs/heads/main",
+                is_remote: ref_name.starts_with("refs/remotes/"),
+                is_selected: false,
+            })
+            .collect()
+    }
+
+    fn branch_ref_set(ref_names: &[&str]) -> HashSet<SharedString> {
+        ref_names
+            .iter()
+            .map(|ref_name| SharedString::from(*ref_name))
+            .collect()
+    }
+
+    fn branch_ref_vec(ref_names: &[&str]) -> Vec<SharedString> {
+        ref_names
+            .iter()
+            .map(|ref_name| SharedString::from(*ref_name))
+            .collect()
+    }
+
+    async fn setup_git_graph_with_branches(
+        branches: &[&str],
+        cx: &mut TestAppContext,
+    ) -> (Entity<GitGraph>, gpui::AnyWindowHandle) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.insert_branches(Path::new("/project/.git"), branches);
+
+        let commit_sha = Oid::from_bytes(&[1; 20]).unwrap();
+        fs.set_graph_commits(
+            Path::new("/project/.git"),
+            vec![Arc::new(InitialGraphCommitData {
+                sha: commit_sha,
+                parents: SmallVec::new(),
+                ref_names: vec!["HEAD".into(), "refs/heads/main".into()],
+            })],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("project should have an active repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let window_handle = cx.window_handle();
+        let workspace_weak = multi_workspace.read_with(&*cx, |multi_workspace, _| {
+            multi_workspace.workspace().downgrade()
+        });
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+
+        (git_graph, window_handle)
     }
 
     fn verify_commit_order(
@@ -8116,5 +9044,206 @@ mod tests {
         ));
         assert!(!GitGraph::is_remote_branch_ref_name("refs/heads/main"));
         assert!(!GitGraph::is_remote_branch_ref_name("refs/tags/v1.0"));
+    }
+
+    #[test]
+    fn test_branch_filter_source_uses_explicit_local_refs_when_remote_branches_are_hidden() {
+        let available_branches = branch_infos(&[
+            "refs/heads/main",
+            "refs/heads/feature",
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/feature",
+        ]);
+        let selected_branches = branch_ref_set(&["refs/heads/main", "refs/heads/feature"]);
+
+        let source = GitGraph::branch_filter_source_for_state(
+            true,
+            false,
+            &available_branches,
+            &selected_branches,
+        );
+
+        assert_eq!(
+            source,
+            LogSource::Branches(branch_ref_vec(&["refs/heads/feature", "refs/heads/main"]))
+        );
+    }
+
+    #[test]
+    fn test_branch_filter_source_uses_all_when_every_visible_ref_is_selected() {
+        let available_branches = branch_infos(&[
+            "refs/heads/main",
+            "refs/heads/feature",
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/feature",
+        ]);
+        let selected_branches = branch_ref_set(&[
+            "refs/heads/main",
+            "refs/heads/feature",
+            "refs/remotes/origin/main",
+            "refs/remotes/origin/feature",
+        ]);
+
+        let source = GitGraph::branch_filter_source_for_state(
+            true,
+            true,
+            &available_branches,
+            &selected_branches,
+        );
+
+        assert_eq!(source, LogSource::All);
+    }
+
+    #[test]
+    fn test_branch_filter_source_returns_empty_branch_list_when_no_refs_are_selected() {
+        let available_branches = branch_infos(&["refs/heads/main", "refs/remotes/origin/main"]);
+        let selected_branches = HashSet::default();
+
+        let source = GitGraph::branch_filter_source_for_state(
+            true,
+            false,
+            &available_branches,
+            &selected_branches,
+        );
+
+        assert_eq!(source, LogSource::Branches(Vec::new()));
+    }
+
+    #[test]
+    fn test_branch_filter_selection_state_tracks_all_none_and_indeterminate() {
+        let available_branches = branch_infos(&[
+            "refs/heads/main",
+            "refs/heads/feature",
+            "refs/remotes/origin/main",
+        ]);
+
+        assert_eq!(
+            GitGraph::branch_selection_state_for_state(
+                true,
+                true,
+                &available_branches,
+                &branch_ref_set(&[
+                    "refs/heads/main",
+                    "refs/heads/feature",
+                    "refs/remotes/origin/main",
+                ]),
+            ),
+            ToggleState::Selected
+        );
+        assert_eq!(
+            GitGraph::branch_selection_state_for_state(
+                true,
+                true,
+                &available_branches,
+                &HashSet::default(),
+            ),
+            ToggleState::Unselected
+        );
+        assert_eq!(
+            GitGraph::branch_selection_state_for_state(
+                true,
+                true,
+                &available_branches,
+                &branch_ref_set(&["refs/heads/main"]),
+            ),
+            ToggleState::Indeterminate
+        );
+    }
+
+    #[test]
+    fn test_ref_name_matches_remote_visibility_hides_remote_display_refs() {
+        let available_branches = branch_infos(&["refs/heads/main", "refs/remotes/origin/main"]);
+
+        assert!(!GitGraph::ref_name_matches_remote_visibility(
+            false,
+            &available_branches,
+            "refs/remotes/origin/main",
+        ));
+        assert!(!GitGraph::ref_name_matches_remote_visibility(
+            false,
+            &available_branches,
+            "origin/main",
+        ));
+        assert!(!GitGraph::ref_name_matches_remote_visibility(
+            false,
+            &available_branches,
+            "HEAD -> origin/main",
+        ));
+        assert!(GitGraph::ref_name_matches_remote_visibility(
+            false,
+            &available_branches,
+            "refs/heads/main",
+        ));
+        assert!(GitGraph::ref_name_matches_remote_visibility(
+            true,
+            &available_branches,
+            "refs/remotes/origin/main",
+        ));
+    }
+
+    #[test]
+    fn test_branch_filter_reconciles_selection_after_branch_reload() {
+        let previous_selection = branch_ref_set(&[
+            "refs/heads/main",
+            "refs/heads/deleted",
+            "refs/remotes/origin/main",
+        ]);
+        let eligible_ref_names = branch_ref_set(&["refs/heads/main", "refs/remotes/origin/main"]);
+
+        let reconciled = GitGraph::reconcile_branch_selection(
+            true,
+            false,
+            &previous_selection,
+            &eligible_ref_names,
+        );
+
+        assert_eq!(
+            reconciled,
+            branch_ref_set(&["refs/heads/main", "refs/remotes/origin/main"])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_branch_filter_entries_exposes_more_than_two_hundred_branches(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (git_graph, _window_handle) = setup_git_graph_with_branches(&["main"], cx).await;
+
+        git_graph.update(cx, |graph, _cx| {
+            graph.branch_filter_state.available_branches = (0..250)
+                .map(|index| {
+                    let ref_name = SharedString::from(format!("refs/heads/branch-{index:03}"));
+                    BranchInfo {
+                        ref_name,
+                        is_head: index == 0,
+                        is_remote: false,
+                        is_selected: true,
+                    }
+                })
+                .collect();
+            graph.branch_filter_state.selected_branches = graph
+                .branch_filter_state
+                .available_branches
+                .iter()
+                .map(|branch| branch.ref_name.clone())
+                .collect();
+            graph.branch_filter_state.branches_loaded = true;
+        });
+
+        let match_count =
+            git_graph.read_with(cx, |graph, _cx| graph.branch_filter_entries("").len());
+        assert_eq!(match_count, 250);
+    }
+
+    #[test]
+    fn test_graph_settings_include_remote_branch_visibility() {
+        let mut settings = GraphSettings::default();
+        settings.show_remote_branches = false;
+
+        let options = GraphLogOptions::from(settings);
+
+        assert!(!options.show_remote_branches);
     }
 }
