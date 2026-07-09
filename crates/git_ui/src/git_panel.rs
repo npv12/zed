@@ -11,8 +11,6 @@ use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
-use crate::staged_diff::StagedDiff;
-use crate::unstaged_diff::UnstagedDiff;
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
@@ -67,7 +65,8 @@ use project::git_store::GitAccess;
 use project::{
     Fs, Project, ProjectPath,
     git_store::{
-        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId, pending_op,
+        CommitDataState, GitStoreEvent, Repository, RepositoryEvent, RepositoryId,
+        diff_buffer_list::DiffBase, pending_op,
     },
     project_settings::{GitPathStyle, ProjectSettings},
 };
@@ -98,7 +97,7 @@ use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
 use workspace::SERIALIZATION_THROTTLE_TIME;
 use workspace::{
-    Item, ModalView, Workspace,
+    ModalView, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
 };
@@ -2430,30 +2429,16 @@ impl GitPanel {
             let entry = self.entries.get(selected_index)?.status_entry()?.clone();
             let target =
                 Self::diff_target_for_section(self.section_for_entry_index(selected_index));
+            let diff_base = match target {
+                DiffTarget::Staged => DiffBase::Staged,
+                DiffTarget::Unstaged => DiffBase::Index,
+                DiffTarget::Uncommitted => DiffBase::Head,
+            };
 
-            match target {
-                DiffTarget::Staged => {
-                    if let Some(staged_diff) = workspace.read(cx).item_of_type::<StagedDiff>(cx) {
-                        staged_diff.update(cx, |staged_diff, cx| {
-                            staged_diff.move_to_entry(entry, window, cx);
-                        });
-                    }
-                }
-                DiffTarget::Unstaged => {
-                    if let Some(unstaged_diff) = workspace.read(cx).item_of_type::<UnstagedDiff>(cx)
-                    {
-                        unstaged_diff.update(cx, |unstaged_diff, cx| {
-                            unstaged_diff.move_to_entry(entry, window, cx);
-                        });
-                    }
-                }
-                DiffTarget::Uncommitted => {
-                    if let Some(project_diff) = workspace.read(cx).item_of_type::<ProjectDiff>(cx) {
-                        project_diff.update(cx, |project_diff, cx| {
-                            project_diff.move_to_entry(entry, window, cx);
-                        });
-                    }
-                }
+            if let Some(project_diff) = workspace.read(cx).item_of_type::<ProjectDiff>(cx) {
+                project_diff.update(cx, |pd, cx| {
+                    pd.set_diff_base(diff_base, Some(entry), window, cx);
+                });
             }
 
             Some(())
@@ -2583,35 +2568,21 @@ impl GitPanel {
         maybe!({
             let selected_index = self.selected_entry?;
             let entry = self.entries.get(selected_index)?.status_entry()?;
-            let workspace = self.workspace.upgrade()?;
-            let git_repo = self.active_repository.as_ref()?;
             let target =
                 Self::diff_target_for_section(self.section_for_entry_index(selected_index));
-
-            if target == DiffTarget::Uncommitted
-                && let Some(project_diff) = workspace.read(cx).active_item_as::<ProjectDiff>(cx)
-                && let Some(project_path) = project_diff.read(cx).active_project_path(cx)
-                && Some(&entry.repo_path)
-                    == git_repo
-                        .read(cx)
-                        .project_path_to_repo_path(&project_path, cx)
-                        .as_ref()
-            {
-                project_diff.focus_handle(cx).focus(window, cx);
-                project_diff.update(cx, |project_diff, cx| project_diff.autoscroll(cx));
-                return None;
+            let diff_base = match target {
+                DiffTarget::Staged => DiffBase::Staged,
+                DiffTarget::Unstaged => DiffBase::Index,
+                DiffTarget::Uncommitted => DiffBase::Head,
             };
 
             self.workspace
-                .update(cx, |workspace, cx| match target {
-                    DiffTarget::Uncommitted => {
-                        ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
-                    }
-                    DiffTarget::Staged => {
-                        StagedDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
-                    }
-                    DiffTarget::Unstaged => {
-                        UnstagedDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
+                .update(cx, |workspace, cx| {
+                    ProjectDiff::deploy_at(workspace, None, window, cx);
+                    if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                        project_diff.update(cx, |pd, cx| {
+                            pd.set_diff_base(diff_base, Some(entry.clone()), window, cx);
+                        });
                     }
                 })
                 .ok();
@@ -5160,7 +5131,12 @@ impl GitPanel {
         };
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
-                StagedDiff::deploy_at(workspace, entry, window, cx);
+                ProjectDiff::deploy_at(workspace, None, window, cx);
+                if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                    project_diff.update(cx, |pd, cx| {
+                        pd.set_diff_base(DiffBase::Staged, entry, window, cx);
+                    });
+                }
             });
         }
     }
@@ -5180,7 +5156,12 @@ impl GitPanel {
         };
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
-                UnstagedDiff::deploy_at(workspace, entry, window, cx);
+                ProjectDiff::deploy_at(workspace, None, window, cx);
+                if let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) {
+                    project_diff.update(cx, |pd, cx| {
+                        pd.set_diff_base(DiffBase::Index, entry, window, cx);
+                    });
+                }
             });
         }
     }
@@ -10100,8 +10081,8 @@ mod tests {
     use util::rel_path::rel_path;
 
     use workspace::{
-        ActivatePaneLeft, ActivatePaneRight, ItemHandle as _, MultiWorkspace, ToolbarItemEvent,
-        ToolbarItemLocation, item::test::TestItem,
+        ActivatePaneLeft, ActivatePaneRight, MultiWorkspace, ToolbarItemEvent, ToolbarItemLocation,
+        item::test::TestItem,
     };
 
     use super::*;
@@ -12019,11 +12000,6 @@ mod tests {
             .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
             .unwrap();
         let mut cx = VisualTestContext::from_window(window_handle.into(), cx);
-        let project_path = project.read_with(&cx, |project, cx| {
-            project
-                .find_project_path(path!("/project/partial.rs"), cx)
-                .expect("partial.rs should have a project path")
-        });
 
         cx.update(|_window, cx| {
             SettingsStore::update_global(cx, |store, cx| {
@@ -12059,13 +12035,8 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(&cx, |workspace, cx| {
-            let staged_diff = workspace
-                .active_item_as::<StagedDiff>(cx)
-                .expect("StagedDiff should be active");
-            assert_eq!(staged_diff.project_path(cx), Some(project_path.clone()));
-            assert_eq!(workspace.items_of_type::<StagedDiff>(cx).count(), 1);
-            assert_eq!(workspace.items_of_type::<UnstagedDiff>(cx).count(), 0);
-            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 0);
+            assert!(workspace.active_item_as::<ProjectDiff>(cx).is_some());
+            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 1);
         });
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -12087,7 +12058,6 @@ mod tests {
             let solo_diff = workspace
                 .active_item_as::<SoloDiffView>(cx)
                 .expect("SoloDiffView should be active");
-            assert_eq!(solo_diff.project_path(cx), Some(project_path.clone()));
             let searchable = solo_diff
                 .read(cx)
                 .as_searchable(&solo_diff, cx)
@@ -12096,7 +12066,7 @@ mod tests {
                 .act_as_type(TypeId::of::<SplittableEditor>(), cx)
                 .and_then(|entity| entity.downcast::<SplittableEditor>().ok())
                 .expect("the split editor should be the searchable item");
-            assert_eq!(workspace.items_of_type::<StagedDiff>(cx).count(), 1);
+            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 1);
             assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 1);
             split_editor
         });
@@ -12132,13 +12102,8 @@ mod tests {
         cx.run_until_parked();
 
         workspace.read_with(&cx, |workspace, cx| {
-            let unstaged_diff = workspace
-                .active_item_as::<UnstagedDiff>(cx)
-                .expect("UnstagedDiff should be active");
-            assert_eq!(unstaged_diff.project_path(cx), Some(project_path));
-            assert_eq!(workspace.items_of_type::<StagedDiff>(cx).count(), 1);
-            assert_eq!(workspace.items_of_type::<UnstagedDiff>(cx).count(), 1);
-            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 0);
+            assert!(workspace.active_item_as::<ProjectDiff>(cx).is_some());
+            assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 1);
         });
     }
 
