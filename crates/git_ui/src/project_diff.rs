@@ -2,8 +2,8 @@ use crate::{
     branch_diff::BranchDiff,
     diff_multibuffer::DiffMultibuffer,
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
-    staged_diff::StagedDiff,
-    unstaged_diff::UnstagedDiff,
+    staged_diff::StagedDiffDelegate,
+    unstaged_diff::UnstagedDiffDelegate,
 };
 use anyhow::{Context as _, Result};
 use buffer_diff::DiffHunkSecondaryStatus;
@@ -69,6 +69,7 @@ pub struct ProjectDiff {
     workspace: WeakEntity<Workspace>,
     diff: Entity<DiffMultibuffer>,
     _diff_observation: Subscription,
+    current_base: DiffBase,
 }
 
 impl ProjectDiff {
@@ -84,12 +85,22 @@ impl ProjectDiff {
         );
         workspace.register_action(
             |workspace, _: &git_actions::ViewUnstagedChanges, window, cx| {
-                UnstagedDiff::deploy_at(workspace, None, window, cx);
+                ProjectDiff::deploy_at(workspace, None, window, cx);
+                if let Some(pd) = workspace.active_item_as::<ProjectDiff>(cx) {
+                    pd.update(cx, |pd, cx| {
+                        pd.set_diff_base(DiffBase::Index, None, window, cx);
+                    });
+                }
             },
         );
         workspace.register_action(
             |workspace, _: &git_actions::ViewStagedChanges, window, cx| {
-                StagedDiff::deploy_at(workspace, None, window, cx);
+                ProjectDiff::deploy_at(workspace, None, window, cx);
+                if let Some(pd) = workspace.active_item_as::<ProjectDiff>(cx) {
+                    pd.update(cx, |pd, cx| {
+                        pd.set_diff_base(DiffBase::Staged, None, window, cx);
+                    });
+                }
             },
         );
         workspace.register_action(|workspace, _: &Add, window, cx| {
@@ -257,11 +268,43 @@ impl ProjectDiff {
             workspace: workspace.downgrade(),
             diff,
             _diff_observation: observation,
+            current_base: DiffBase::Head,
         }
     }
 
-    pub fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
-        self.diff.read(cx).diff_base(cx)
+    pub fn diff_base(&self, _cx: &App) -> &DiffBase {
+        &self.current_base
+    }
+
+    pub fn set_diff_base(
+        &mut self,
+        base: DiffBase,
+        entry: Option<GitStatusEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.current_base == base {
+            if let Some(entry) = entry {
+                self.move_to_entry(entry, window, cx);
+            }
+            return;
+        }
+        self.diff.update(cx, |diff, cx| {
+            diff.branch_diff()
+                .update(cx, |bd, cx| bd.set_diff_base(base.clone(), cx));
+            diff.editor().update(cx, |editor, cx| {
+                let delegate: Option<Arc<dyn editor::DiffHunkDelegate>> = match &base {
+                    DiffBase::Staged => Some(Arc::new(StagedDiffDelegate)),
+                    DiffBase::Index => Some(Arc::new(UnstagedDiffDelegate)),
+                    _ => Some(Arc::new(UncommittedDiffHunkDelegate)),
+                };
+                editor.set_diff_hunk_delegate(delegate, cx);
+            });
+        });
+        self.current_base = base;
+        if let Some(entry) = entry {
+            self.move_to_entry(entry, window, cx);
+        }
     }
 
     pub(crate) fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
@@ -434,7 +477,12 @@ impl Item for ProjectDiff {
     }
 
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Uncommitted Changes".into()
+        match self.current_base {
+            DiffBase::Head => "Uncommitted Changes".into(),
+            DiffBase::Staged => "Staged Changes".into(),
+            DiffBase::Index => "Unstaged Changes".into(),
+            _ => "Changes".into(),
+        }
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {
@@ -808,6 +856,7 @@ impl Render for ProjectDiffToolbar {
 
         let (additions, deletions) = project_diff.read(cx).calculate_changed_lines(cx);
         let is_multibuffer_empty = project_diff.read(cx).multibuffer(cx).read(cx).is_empty();
+        let diff_base = project_diff.read(cx).diff_base(cx).clone();
 
         let stage_all_button_width = rems(5.);
 
@@ -860,49 +909,57 @@ impl Render for ProjectDiffToolbar {
             .child(
                 h_group_sm()
                     .when(button_states.selection, |this| {
-                        this.child(
-                            Button::new("stage", "Toggle Staged")
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Toggle Staged",
-                                    &ToggleStaged,
-                                    &focus_handle,
-                                ))
-                                .disabled(!button_states.stage && !button_states.unstage)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&ToggleStaged, window, cx)
-                                })),
-                        )
+                        this.when(diff_base == DiffBase::Head, |this| {
+                            this.child(
+                                Button::new("stage", "Toggle Staged")
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        "Toggle Staged",
+                                        &ToggleStaged,
+                                        &focus_handle,
+                                    ))
+                                    .disabled(!button_states.stage && !button_states.unstage)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dispatch_action(&ToggleStaged, window, cx)
+                                    })),
+                            )
+                        })
                     })
                     .when(!button_states.selection, |this| {
-                        this.child(
-                            Button::new("stage", "Stage")
-                                .disabled(!button_states.stage)
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Stage and Go to Next Hunk",
-                                    &StageAndNext,
-                                    &focus_handle,
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&StageAndNext, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("unstage", "Unstage")
-                                .disabled(!button_states.unstage)
-                                .tooltip(Tooltip::for_action_title_in(
-                                    "Unstage and Go to Next Hunk",
-                                    &UnstageAndNext,
-                                    &focus_handle,
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.dispatch_action(&UnstageAndNext, window, cx)
-                                })),
-                        )
+                        this.when(diff_base != DiffBase::Staged, |this| {
+                            this.child(
+                                Button::new("stage", "Stage")
+                                    .disabled(!button_states.stage)
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        "Stage and Go to Next Hunk",
+                                        &StageAndNext,
+                                        &focus_handle,
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dispatch_action(&StageAndNext, window, cx)
+                                    })),
+                            )
+                        })
+                        .when(diff_base != DiffBase::Index, |this| {
+                            this.child(
+                                Button::new("unstage", "Unstage")
+                                    .disabled(!button_states.unstage)
+                                    .tooltip(Tooltip::for_action_title_in(
+                                        "Unstage and Go to Next Hunk",
+                                        &UnstageAndNext,
+                                        &focus_handle,
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.dispatch_action(&UnstageAndNext, window, cx)
+                                    })),
+                            )
+                        })
                     }),
             )
             .child(Divider::vertical())
             .when(
-                button_states.unstage_all && !button_states.stage_all,
+                button_states.unstage_all
+                    && !button_states.stage_all
+                    && diff_base != DiffBase::Index,
                 |this| {
                     this.child(
                         Button::new("unstage-all", "Unstage All")
@@ -919,7 +976,8 @@ impl Render for ProjectDiffToolbar {
                 },
             )
             .when(
-                !button_states.unstage_all || button_states.stage_all,
+                (!button_states.unstage_all || button_states.stage_all)
+                    && diff_base != DiffBase::Staged,
                 |this| {
                     this.child(
                         Button::new("stage-all", "Stage All")
@@ -1415,22 +1473,17 @@ mod tests {
         });
         cx.run_until_parked();
 
+        // ViewUnstagedChanges now reuses the same ProjectDiff tab, swapping the base.
         let unstaged_item = workspace.update(cx, |workspace, cx| {
-            workspace.active_item_as::<UnstagedDiff>(cx).unwrap()
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
         });
-        assert_ne!(diff_item.entity_id(), unstaged_item.entity_id());
-        let unstaged_editor = workspace.update(cx, |workspace, cx| {
-            let active_item = workspace.active_item(cx).unwrap();
-            assert_eq!(active_item.tab_content_text(0, cx), "Unstaged Changes");
-            active_item
-                .act_as::<DiffMultibuffer>(cx)
-                .unwrap()
-                .read(cx)
-                .editor()
-                .read(cx)
-                .rhs_editor()
-                .clone()
-        });
+        assert_eq!(diff_item.entity_id(), unstaged_item.entity_id());
+        assert_eq!(
+            unstaged_item.read_with(cx, |diff, cx| diff.tab_content_text(0, cx)),
+            "Unstaged Changes"
+        );
+        let unstaged_editor =
+            unstaged_item.read_with(cx, |diff, cx| diff.editor(cx).read(cx).rhs_editor().clone());
         assert_eq!(
             unstaged_editor.read_with(cx, |editor, cx| {
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -1478,19 +1531,17 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let staged_editor = workspace.update(cx, |workspace, cx| {
-            workspace.active_item_as::<StagedDiff>(cx).unwrap();
-            let active_item = workspace.active_item(cx).unwrap();
-            assert_eq!(active_item.tab_content_text(0, cx), "Staged Changes");
-            active_item
-                .act_as::<DiffMultibuffer>(cx)
-                .unwrap()
-                .read(cx)
-                .editor()
-                .read(cx)
-                .rhs_editor()
-                .clone()
+        // ViewStagedChanges now reuses the same ProjectDiff tab, swapping the base.
+        let staged_item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
         });
+        assert_eq!(diff_item.entity_id(), staged_item.entity_id());
+        assert_eq!(
+            staged_item.read_with(cx, |diff, cx| diff.tab_content_text(0, cx)),
+            "Staged Changes"
+        );
+        let staged_editor =
+            staged_item.read_with(cx, |diff, cx| diff.editor(cx).read(cx).rhs_editor().clone());
         assert_eq!(
             staged_editor.read_with(cx, |editor, cx| {
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
