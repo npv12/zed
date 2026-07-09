@@ -18,9 +18,9 @@ use git::{
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
-    Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength, DismissEvent,
-    DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
+    Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
+    DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
+    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollHandle, ScrollStrategy,
     ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
     px, uniform_list,
@@ -52,9 +52,9 @@ use std::{
 use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
-    Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
-    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing,
-    RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
+    Checkbox, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu, DiffStat, Divider,
+    HeaderResizeInfo, HighlightedLabel, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu,
+    PopoverMenuHandle, RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
     TableRenderContext, TableResizeBehavior, Tooltip, WithScrollbar, bind_redistributable_columns,
     prelude::*, redistribute_hidden_fractions, redistribute_hidden_widths,
     render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
@@ -525,10 +525,52 @@ impl QueryState {
 
 struct SearchState {
     case_sensitive: bool,
+    filter_matches: bool,
     editor: Entity<Editor>,
     state: QueryState,
     matches: IndexSet<Oid>,
+    filtered_entry_indices: Vec<usize>,
+    filtered_visible_rows_by_entry_index: HashMap<usize, usize>,
     selected_index: Option<usize>,
+}
+
+impl SearchState {
+    fn clear_results(&mut self) {
+        self.matches.clear();
+        self.filtered_entry_indices.clear();
+        self.filtered_visible_rows_by_entry_index.clear();
+        self.selected_index = None;
+    }
+
+    fn insert_filtered_entry_indices(&mut self, entry_indices: impl IntoIterator<Item = usize>) {
+        let mut changed = false;
+
+        for entry_index in entry_indices {
+            match self.filtered_entry_indices.binary_search(&entry_index) {
+                Ok(_) => {}
+                Err(insert_index) => {
+                    self.filtered_entry_indices
+                        .insert(insert_index, entry_index);
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            self.rebuild_filtered_visible_rows();
+        }
+    }
+
+    fn rebuild_filtered_visible_rows(&mut self) {
+        self.filtered_visible_rows_by_entry_index.clear();
+        self.filtered_visible_rows_by_entry_index.extend(
+            self.filtered_entry_indices
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(visible_row, entry_index)| (entry_index, visible_row)),
+        );
+    }
 }
 
 struct SplitState {
@@ -592,6 +634,8 @@ actions!(
         ScrollDown,
         /// Toggles the selected commit's changed files between flat and tree views.
         ToggleChangedFilesView,
+        /// Toggles filtering the graph to commits matching the search query.
+        ToggleSearchFilter,
     ]
 );
 
@@ -1332,13 +1376,13 @@ pub struct GitGraph {
     changed_files_view_mode: ChangedFilesViewMode,
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
+    filter_popover_handle: PopoverMenuHandle<ContextMenu>,
 }
 
 impl GitGraph {
     fn invalidate_state(&mut self, cx: &mut Context<Self>) {
         self.graph_data.clear();
-        self.search_state.matches.clear();
-        self.search_state.selected_index = None;
+        self.search_state.clear_results();
         self.search_state.state.next_state();
         self.context_menu = None;
         cx.emit(ItemEvent::Edit);
@@ -1371,7 +1415,42 @@ impl GitGraph {
             .last_item_size
             .map_or(window.viewport_size().height, |size| size.item.height);
 
-        ((viewport_height / row_height).ceil() as usize).min(self.graph_data.commits.len())
+        ((viewport_height / row_height).ceil() as usize).min(self.visible_commit_count())
+    }
+
+    fn filter_search_matches(&self) -> bool {
+        self.search_state.filter_matches
+            && matches!(self.search_state.state, QueryState::Confirmed(_))
+    }
+
+    fn visible_commit_count(&self) -> usize {
+        if self.filter_search_matches() {
+            self.search_state.filtered_entry_indices.len()
+        } else {
+            self.graph_data.commits.len()
+        }
+    }
+
+    fn entry_index_for_visible_row(&self, visible_row: usize) -> Option<usize> {
+        if self.filter_search_matches() {
+            self.search_state
+                .filtered_entry_indices
+                .get(visible_row)
+                .copied()
+        } else {
+            (visible_row < self.graph_data.commits.len()).then_some(visible_row)
+        }
+    }
+
+    fn visible_row_for_entry_index(&self, entry_index: usize) -> Option<usize> {
+        if self.filter_search_matches() {
+            self.search_state
+                .filtered_visible_rows_by_entry_index
+                .get(&entry_index)
+                .copied()
+        } else {
+            (entry_index < self.graph_data.commits.len()).then_some(entry_index)
+        }
     }
 
     fn graph_canvas_content_width(&self) -> Pixels {
@@ -1551,8 +1630,11 @@ impl GitGraph {
             git_store,
             search_state: SearchState {
                 case_sensitive: false,
+                filter_matches: false,
                 editor: search_editor,
                 matches: IndexSet::default(),
+                filtered_entry_indices: Vec::default(),
+                filtered_visible_rows_by_entry_index: HashMap::default(),
                 selected_index: None,
                 state: QueryState::Empty,
             },
@@ -1578,6 +1660,7 @@ impl GitGraph {
             changed_files_view_mode: ChangedFilesViewMode::default(),
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
+            filter_popover_handle: PopoverMenuHandle::default(),
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1634,6 +1717,18 @@ impl GitGraph {
                                     cx,
                                 );
                                 self.graph_data.add_commits(commits);
+                                let filtered_entry_indices = commits
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(offset, commit)| {
+                                        self.search_state
+                                            .matches
+                                            .contains(&commit.sha)
+                                            .then_some(old_count + offset)
+                                    })
+                                    .collect::<Vec<_>>();
+                                self.search_state
+                                    .insert_filtered_entry_indices(filtered_entry_indices);
 
                                 let pending_sha_index = self.pending_select_sha.and_then(|oid| {
                                     repository.get_graph_data(source.clone(), *order).and_then(
@@ -1791,19 +1886,44 @@ impl GitGraph {
         // users scroll through the git graph
         if let Some(repository) = repository.as_ref() {
             const FETCH_RANGE: usize = 100;
-            repository.update(cx, |repository, cx| {
-                self.graph_data.commits[range.start.saturating_sub(FETCH_RANGE)
-                    ..(range.end + FETCH_RANGE)
-                        .min(self.graph_data.commits.len().saturating_sub(1))]
-                    .iter()
-                    .for_each(|commit| {
-                        repository.fetch_commit_data(commit.data.sha, false, cx);
-                    });
-            });
+            let fetch_range_start = range.start.saturating_sub(FETCH_RANGE);
+            let fetch_range_end = range.end + FETCH_RANGE;
+
+            if self.filter_search_matches() {
+                let commit_indices = &self.search_state.filtered_entry_indices;
+                repository.update(cx, |repository, cx| {
+                    let fetch_range_end = fetch_range_end.min(commit_indices.len());
+                    commit_indices[fetch_range_start.min(fetch_range_end)..fetch_range_end]
+                        .iter()
+                        .filter_map(|index| self.graph_data.commits.get(*index))
+                        .for_each(|commit| {
+                            repository.fetch_commit_data(commit.data.sha, false, cx);
+                        });
+                });
+            } else {
+                repository.update(cx, |repository, cx| {
+                    let fetch_range_end = fetch_range_end.min(self.graph_data.commits.len());
+                    self.graph_data.commits
+                        [fetch_range_start.min(fetch_range_end)..fetch_range_end]
+                        .iter()
+                        .for_each(|commit| {
+                            repository.fetch_commit_data(commit.data.sha, false, cx);
+                        });
+                });
+            }
         }
 
         range
-            .map(|idx| {
+            .map(|visible_idx| {
+                let Some(idx) = self.entry_index_for_visible_row(visible_idx) else {
+                    return vec![
+                        div().h(row_height).into_any_element(),
+                        div().h(row_height).into_any_element(),
+                        div().h(row_height).into_any_element(),
+                        div().h(row_height).into_any_element(),
+                    ];
+                };
+
                 let Some((commit, repository)) =
                     self.graph_data.commits.get(idx).zip(repository.as_ref())
                 else {
@@ -1933,63 +2053,83 @@ impl GitGraph {
     }
 
     fn select_first(&mut self, _: &SelectFirst, _window: &mut Window, cx: &mut Context<Self>) {
-        self.select_entry(0, ScrollStrategy::Nearest, cx);
+        if let Some(entry_index) = self.entry_index_for_visible_row(0) {
+            self.select_entry(entry_index, ScrollStrategy::Nearest, cx);
+        }
     }
 
     fn select_prev(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(selected_entry_idx) = &self.selected_entry_idx {
-            self.select_entry(
-                selected_entry_idx.saturating_sub(1),
-                ScrollStrategy::Nearest,
-                cx,
-            );
+        if let Some(selected_entry_idx) = self.selected_entry_idx {
+            if let Some(visible_row) = self.visible_row_for_entry_index(selected_entry_idx) {
+                if let Some(entry_index) =
+                    self.entry_index_for_visible_row(visible_row.saturating_sub(1))
+                {
+                    self.select_entry(entry_index, ScrollStrategy::Nearest, cx);
+                }
+            } else {
+                self.select_first(&SelectFirst, window, cx);
+            }
         } else {
             self.select_first(&SelectFirst, window, cx);
         }
     }
 
     fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(selected_entry_idx) = &self.selected_entry_idx {
-            self.select_entry(
-                selected_entry_idx
-                    .saturating_add(1)
-                    .min(self.graph_data.commits.len().saturating_sub(1)),
-                ScrollStrategy::Nearest,
-                cx,
-            );
+        if let Some(selected_entry_idx) = self.selected_entry_idx {
+            if let Some(visible_row) = self.visible_row_for_entry_index(selected_entry_idx) {
+                let last_visible_row = self.visible_commit_count().saturating_sub(1);
+                if let Some(entry_index) = self.entry_index_for_visible_row(
+                    visible_row.saturating_add(1).min(last_visible_row),
+                ) {
+                    self.select_entry(entry_index, ScrollStrategy::Nearest, cx);
+                }
+            } else {
+                self.select_prev(&SelectPrevious, window, cx);
+            }
         } else {
             self.select_prev(&SelectPrevious, window, cx);
         }
     }
 
     fn select_last(&mut self, _: &SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
-        self.select_entry(
-            self.graph_data.commits.len().saturating_sub(1),
-            ScrollStrategy::Nearest,
-            cx,
-        );
+        if let Some(entry_index) =
+            self.entry_index_for_visible_row(self.visible_commit_count().saturating_sub(1))
+        {
+            self.select_entry(entry_index, ScrollStrategy::Nearest, cx);
+        }
     }
 
     fn scroll_up(&mut self, _: &ScrollUp, window: &mut Window, cx: &mut Context<Self>) {
         let step = (self.visible_row_count(window, cx) / 2).max(1);
-        let target_idx = self.selected_entry_idx.unwrap_or(0).saturating_sub(step);
 
-        self.select_entry(target_idx, ScrollStrategy::Nearest, cx);
+        let visible_row = self
+            .selected_entry_idx
+            .and_then(|entry_index| self.visible_row_for_entry_index(entry_index))
+            .unwrap_or(0);
+
+        if let Some(entry_index) =
+            self.entry_index_for_visible_row(visible_row.saturating_sub(step))
+        {
+            self.select_entry(entry_index, ScrollStrategy::Nearest, cx);
+        }
     }
 
     fn scroll_down(&mut self, _: &ScrollDown, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(last_entry_idx) = self.graph_data.commits.len().checked_sub(1) else {
+        let Some(last_visible_row) = self.visible_commit_count().checked_sub(1) else {
             return;
         };
 
         let step = (self.visible_row_count(window, cx) / 2).max(1);
-        let target_idx = self
+        let visible_row = self
             .selected_entry_idx
+            .and_then(|entry_index| self.visible_row_for_entry_index(entry_index))
             .unwrap_or(0)
             .saturating_add(step)
-            .min(last_entry_idx);
+            .min(last_visible_row);
 
-        self.select_entry(target_idx, ScrollStrategy::Nearest, cx);
+        if let Some(entry_index) = self.entry_index_for_visible_row(visible_row) {
+            self.select_entry(entry_index, ScrollStrategy::Nearest, cx);
+        }
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
@@ -2008,13 +2148,36 @@ impl GitGraph {
         cx.notify();
     }
 
+    fn toggle_search_filter(
+        &mut self,
+        _: &ToggleSearchFilter,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_state.filter_matches = !self.search_state.filter_matches;
+        if let Some(selected_entry_idx) = self.selected_entry_idx
+            && self
+                .visible_row_for_entry_index(selected_entry_idx)
+                .is_none()
+        {
+            self.selected_entry_idx = None;
+            self.selected_commit_diff = None;
+            self.selected_commit_diff_stats = None;
+            self.changed_files_expanded_dirs.clear();
+        }
+        self.table_interaction_state.update(cx, |state, cx| {
+            state.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     fn search(&mut self, query: SharedString, cx: &mut Context<Self>) {
         let Some(repo) = self.get_repository(cx) else {
             return;
         };
 
-        self.search_state.matches.clear();
-        self.search_state.selected_index = None;
+        self.search_state.clear_results();
         self.search_state.editor.update(cx, |editor, _cx| {
             editor.set_text_style_refinement(Default::default());
         });
@@ -2047,12 +2210,32 @@ impl GitGraph {
                 }
 
                 this.update(cx, |this, cx| {
+                    this.search_state
+                        .matches
+                        .extend(pending_oids.iter().copied());
+                    let pending_entry_indices = this
+                        .get_repository(cx)
+                        .and_then(|repository| {
+                            repository
+                                .read(cx)
+                                .get_graph_data(this.log_source.clone(), this.log_order)
+                                .map(|data| {
+                                    pending_oids
+                                        .iter()
+                                        .filter_map(|oid| {
+                                            data.commit_oid_to_index.get(oid).copied()
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                        })
+                        .unwrap_or_default();
+                    this.search_state
+                        .insert_filtered_entry_indices(pending_entry_indices);
+
                     if this.search_state.selected_index.is_none() {
                         this.search_state.selected_index = Some(0);
                         this.select_commit_by_sha(first_oid, cx);
                     }
-
-                    this.search_state.matches.extend(pending_oids);
                     cx.notify();
                 })
                 .ok();
@@ -2134,8 +2317,11 @@ impl GitGraph {
         self.changed_files_expanded_dirs.clear();
         self.changed_files_scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
+        let visible_row = self.visible_row_for_entry_index(idx).unwrap_or(idx);
         self.table_interaction_state.update(cx, |state, cx| {
-            state.scroll_handle.scroll_to_item(idx, scroll_strategy);
+            state
+                .scroll_handle
+                .scroll_to_item(visible_row, scroll_strategy);
             cx.notify();
         });
 
@@ -2581,6 +2767,44 @@ impl GitGraph {
                         query_focus_handle,
                     )),
             )
+            .child({
+                let filter_state = self.search_state.filter_matches;
+                PopoverMenu::new("git-graph-filter")
+                    .trigger(
+                        IconButton::new("git-graph-filter-button", IconName::Filter)
+                            .shape(ui::IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .toggle_state(filter_state),
+                    )
+                    .anchor(Anchor::TopRight)
+                    .with_handle(self.filter_popover_handle.clone())
+                    .menu(move |window, cx| {
+                        Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                            menu.custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-filter-matches",
+                                        if filter_state {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("Filter to Matches")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(ToggleSearchFilter.boxed_clone(), cx);
+                                },
+                            )
+                        }))
+                    })
+                    .into_any_element()
+            })
             .child(
                 h_flex()
                     .min_w_64()
@@ -3170,9 +3394,9 @@ impl GitGraph {
             .last_item_size
             .map(|size| size.item.height)
             .unwrap_or(window.viewport_size().height);
-        let loaded_commit_count = self.graph_data.commits.len();
+        let visible_commit_count = self.visible_commit_count();
 
-        let content_height = row_height * loaded_commit_count;
+        let content_height = row_height * visible_commit_count;
         let max_scroll = (content_height - viewport_height).max(px(0.));
         let scroll_offset_y = (-table_state.scroll_offset().y).clamp(px(0.), max_scroll);
 
@@ -3187,19 +3411,42 @@ impl GitGraph {
         };
         let last_visible_row = first_visible_row + visible_row_count + 1;
 
-        let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
-            ..(last_visible_row).min(loaded_commit_count);
-        let rows = self.graph_data.commits[viewport_range.clone()].to_vec();
-        let commit_lines: Vec<_> = self
-            .graph_data
-            .lines
-            .iter()
-            .filter(|line| {
-                line.full_interval.start <= viewport_range.end
-                    && line.full_interval.end >= viewport_range.start
-            })
-            .cloned()
-            .collect();
+        let viewport_range = first_visible_row.min(visible_commit_count.saturating_sub(1))
+            ..(last_visible_row).min(visible_commit_count);
+        let rows = if self.filter_search_matches() {
+            let visible_commit_indices = &self.search_state.filtered_entry_indices;
+            visible_commit_indices[viewport_range.clone()]
+                .iter()
+                .filter_map(|entry_index| {
+                    self.graph_data
+                        .commits
+                        .get(*entry_index)
+                        .map(|commit| (*entry_index, commit))
+                })
+                .map(|(entry_index, commit)| (entry_index, commit.lane, commit.color_idx))
+                .collect::<Vec<_>>()
+        } else {
+            self.graph_data.commits[viewport_range.clone()]
+                .iter()
+                .enumerate()
+                .map(|(offset, commit)| {
+                    (viewport_range.start + offset, commit.lane, commit.color_idx)
+                })
+                .collect::<Vec<_>>()
+        };
+        let commit_lines: Vec<_> = if self.filter_search_matches() {
+            Vec::new()
+        } else {
+            self.graph_data
+                .lines
+                .iter()
+                .filter(|line| {
+                    line.full_interval.start <= viewport_range.end
+                        && line.full_interval.end >= viewport_range.start
+                })
+                .cloned()
+                .collect()
+        };
 
         let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
@@ -3224,12 +3471,10 @@ impl GitGraph {
                         cx.theme().colors().element_hover
                     };
 
-                    for visible_row_idx in 0..rows.len() {
-                        let absolute_row_idx = first_visible_row + visible_row_idx;
-                        let is_hovered = hovered_entry_idx == Some(absolute_row_idx);
-                        let is_selected = selected_entry_idx == Some(absolute_row_idx);
-                        let is_context_menu_target =
-                            context_menu_entry_idx == Some(absolute_row_idx);
+                    for (visible_row_idx, (entry_idx, _, _)) in rows.iter().enumerate() {
+                        let is_hovered = hovered_entry_idx == Some(*entry_idx);
+                        let is_selected = selected_entry_idx == Some(*entry_idx);
+                        let is_context_menu_target = context_menu_entry_idx == Some(*entry_idx);
 
                         if is_hovered || is_selected || is_context_menu_target {
                             let row_y = bounds.origin.y + visible_row_idx as f32 * row_height
@@ -3252,13 +3497,13 @@ impl GitGraph {
                         }
                     }
 
-                    for (row_idx, row) in rows.into_iter().enumerate() {
-                        let row_color = accent_colors.color_for_index(row.color_idx as u32);
+                    for (row_idx, (_, lane, color_idx)) in rows.into_iter().enumerate() {
+                        let row_color = accent_colors.color_for_index(color_idx as u32);
                         let row_y_center =
                             bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
                                 - vertical_scroll_offset;
 
-                        let commit_x = lane_center_x(bounds, row.lane as f32);
+                        let commit_x = lane_center_x(bounds, lane as f32);
 
                         draw_commit_circle(commit_x, row_y_center, row_color, window);
                     }
@@ -3448,11 +3693,9 @@ impl GitGraph {
         if local_y >= px(0.) && local_y < canvas_bounds.size.height {
             let absolute_y = local_y + scroll_offset_y;
             let row_height = Self::row_height(window, cx);
-            let absolute_row = (absolute_y / row_height).floor() as usize;
+            let visible_row = (absolute_y / row_height).floor() as usize;
 
-            if absolute_row < self.graph_data.commits.len() {
-                return Some(absolute_row);
-            }
+            return self.entry_index_for_visible_row(visible_row);
         }
 
         None
@@ -3549,10 +3792,14 @@ impl GitGraph {
 
         let viewport_height = table_state.scroll_handle.viewport().size.height;
 
-        let commit_count = match self.graph_data.max_commit_count {
-            AllCommitCount::Loading(count) => count,
-            AllCommitCount::FullyLoaded(count) => count,
-            AllCommitCount::NotLoaded => self.graph_data.commits.len(),
+        let commit_count = if self.filter_search_matches() {
+            self.visible_commit_count()
+        } else {
+            match self.graph_data.max_commit_count {
+                AllCommitCount::Loading(count) => count,
+                AllCommitCount::FullyLoaded(count) => count,
+                AllCommitCount::NotLoaded => self.graph_data.commits.len(),
+            }
         };
         let content_height = Self::row_height(window, cx) * commit_count;
         let max_vertical_scroll = (viewport_height - content_height).min(px(0.));
@@ -3704,6 +3951,11 @@ impl Render for GitGraph {
             self.search(query, cx);
         }
         let (commit_count, is_loading) = self.commit_count_and_loading_state(cx);
+        let visible_commit_count = if self.filter_search_matches() {
+            self.visible_commit_count()
+        } else {
+            commit_count
+        };
 
         let error = self.get_repository(cx).and_then(|repo| {
             repo.read(cx)
@@ -3711,7 +3963,7 @@ impl Render for GitGraph {
                 .and_then(|data| data.error.clone())
         });
 
-        let content = if commit_count == 0 {
+        let content = if visible_commit_count == 0 {
             let message = if let Some(error) = &error {
                 format!("Error loading: {}", error)
             } else if is_loading {
@@ -3742,6 +3994,8 @@ impl Render for GitGraph {
             // rendered as a separate canvas outside the table.
             let graph_visible =
                 is_path_history || !column_filter.get(0usize).copied().unwrap_or(false);
+            let show_graph_column =
+                !is_path_history && graph_visible && !self.filter_search_matches();
 
             let table_offset = if is_path_history { 0 } else { 1 };
             let table_filter = column_filter
@@ -3755,7 +4009,6 @@ impl Render for GitGraph {
             );
             let header_context = TableRenderContext::for_column_widths(Some(header_widths), true)
                 .with_column_filter(Some(column_filter));
-
             let [
                 graph_fraction,
                 description_fraction,
@@ -3763,9 +4016,11 @@ impl Render for GitGraph {
                 author_fraction,
                 commit_fraction,
             ] = self.preview_column_fractions(window, cx);
-            let table_fraction =
-                description_fraction + date_fraction + author_fraction + commit_fraction;
-            let table_width_config = self.table_column_width_config(window, cx);
+            let table_fraction = if show_graph_column {
+                description_fraction + date_fraction + author_fraction + commit_fraction
+            } else {
+                1.0
+            };
 
             let table_collapsed = table_fraction <= f32::EPSILON;
             let graph_content_width = self.graph_canvas_content_width();
@@ -3789,7 +4044,7 @@ impl Render for GitGraph {
                                     }),
                                 )
                                 .child(render_table_header(
-                                    if !is_path_history {
+                                    if show_graph_column {
                                         TableRow::from_vec(
                                             vec![
                                                 Label::new("Graph")
@@ -3875,13 +4130,20 @@ impl Render for GitGraph {
                                 .interactable(&self.table_interaction_state)
                                 .hide_row_borders()
                                 .hide_row_hover()
-                                .width_config(table_width_config)
+                                .width_config(self.table_column_width_config(window, cx))
                                 .column_filter(table_filter)
                                 .map_row(move |(index, row), window, cx| {
-                                    let is_selected = selected_entry_idx == Some(index);
-                                    let is_hovered = hovered_entry_idx == Some(index);
+                                    let entry_index = weak_self
+                                        .read_with(cx, |this, _| {
+                                            this.entry_index_for_visible_row(index)
+                                        })
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(index);
+                                    let is_selected = selected_entry_idx == Some(entry_index);
+                                    let is_hovered = hovered_entry_idx == Some(entry_index);
                                     let is_context_menu_target =
-                                        context_menu_entry_idx == Some(index);
+                                        context_menu_entry_idx == Some(entry_index);
                                     let table_focus_handle = table_focus_handle.clone();
                                     let is_focused = focus_handle.is_focused(window)
                                         || table_focus_handle.is_focused(window);
@@ -3909,11 +4171,15 @@ impl Render for GitGraph {
                                             weak_for_hover
                                                 .update(cx, |this, cx| {
                                                     if is_hovered {
-                                                        if this.hovered_entry_idx != Some(index) {
-                                                            this.hovered_entry_idx = Some(index);
+                                                        if this.hovered_entry_idx
+                                                            != Some(entry_index)
+                                                        {
+                                                            this.hovered_entry_idx =
+                                                                Some(entry_index);
                                                             cx.notify();
                                                         }
-                                                    } else if this.hovered_entry_idx == Some(index)
+                                                    } else if this.hovered_entry_idx
+                                                        == Some(entry_index)
                                                     {
                                                         this.hovered_entry_idx = None;
                                                         cx.notify();
@@ -3924,7 +4190,7 @@ impl Render for GitGraph {
                                         .on_click(move |event, window, cx| {
                                             weak.update(cx, |this, cx| {
                                                 this.handle_entry_click(
-                                                    index,
+                                                    entry_index,
                                                     event,
                                                     ScrollStrategy::Center,
                                                     Some(&table_focus_handle),
@@ -3940,7 +4206,10 @@ impl Render for GitGraph {
                                                 weak_for_context_menu
                                                     .update(cx, |this, cx| {
                                                         this.handle_entry_secondary_mouse_down(
-                                                            index, event, window, cx,
+                                                            entry_index,
+                                                            event,
+                                                            window,
+                                                            cx,
                                                         );
                                                     })
                                                     .ok();
@@ -3950,7 +4219,7 @@ impl Render for GitGraph {
                                 })
                                 .uniform_list(
                                     "git-graph-commits",
-                                    commit_count,
+                                    visible_commit_count,
                                     cx.processor(Self::render_table_rows),
                                 );
 
@@ -3963,7 +4232,7 @@ impl Render for GitGraph {
                                     .child(
                                         h_flex()
                                             .size_full()
-                                            .when(!is_path_history && graph_visible, |this| {
+                                            .when(show_graph_column, |this| {
                                                 this.child(
                                                     div()
                                                         .map(|this| {
@@ -4052,6 +4321,7 @@ impl Render for GitGraph {
             .on_action(cx.listener(Self::scroll_down))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::toggle_changed_files_view))
+            .on_action(cx.listener(Self::toggle_search_filter))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
