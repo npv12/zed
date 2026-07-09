@@ -30,7 +30,7 @@ use serde::Deserialize;
 use settings::GitDiffBaseSetting;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
-use ui::{DiffStat, Divider, Tooltip, prelude::*};
+use ui::{ContextMenu, DiffStat, Divider, DropdownMenu, DropdownStyle, Tooltip, prelude::*};
 use workspace::{
     ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
@@ -846,7 +846,7 @@ impl ToolbarItemView for ProjectDiffToolbar {
 }
 
 impl Render for ProjectDiffToolbar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(project_diff) = self.project_diff(cx) else {
             return div();
         };
@@ -1014,6 +1014,45 @@ impl Render for ProjectDiffToolbar {
                         }),
                     ),
                 )
+            })
+            .child(Divider::vertical())
+            .child({
+                let current_label: SharedString = match diff_base {
+                    DiffBase::Head => "Uncommitted",
+                    DiffBase::Staged => "Staged",
+                    DiffBase::Index => "Unstaged",
+                    _ => "Uncommitted",
+                }
+                .into();
+                let project_diff = project_diff.clone();
+                let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                    menu.entry("Uncommitted Changes", None, {
+                        let pd = project_diff.clone();
+                        move |window, cx| {
+                            pd.update(cx, |pd, cx| {
+                                pd.set_diff_base(DiffBase::Head, None, window, cx);
+                            });
+                        }
+                    })
+                    .entry("Staged Changes", None, {
+                        let pd = project_diff.clone();
+                        move |window, cx| {
+                            pd.update(cx, |pd, cx| {
+                                pd.set_diff_base(DiffBase::Staged, None, window, cx);
+                            });
+                        }
+                    })
+                    .entry("Unstaged Changes", None, {
+                        let pd = project_diff.clone();
+                        move |window, cx| {
+                            pd.update(cx, |pd, cx| {
+                                pd.set_diff_base(DiffBase::Index, None, window, cx);
+                            });
+                        }
+                    })
+                });
+                DropdownMenu::new("diff-mode-switcher", current_label, menu)
+                    .style(DropdownStyle::Subtle)
             })
     }
 }
