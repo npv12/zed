@@ -7,8 +7,8 @@ use anyhow::Result;
 use buffer_diff::BufferDiff;
 use collections::{HashMap, HashSet};
 use editor::{
-    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
-    multibuffer_context_lines, scroll::Autoscroll,
+    EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
@@ -326,65 +326,6 @@ impl DiffMultibuffer {
         }
 
         (selection, ranges)
-    }
-
-    /// Ranges for a toolbar stage/unstage action: the selection, or the cursor
-    /// (a zero-width range that resolves to the single hunk under it) when
-    /// there is no selection. Unlike [`Self::selected_ranges`], this never
-    /// widens to the whole excerpt, so actions affect one hunk at a time.
-    fn hunk_action_ranges(&self, cx: &App) -> Vec<std::ops::Range<multi_buffer::Anchor>> {
-        self.editor
-            .read(cx)
-            .rhs_editor()
-            .read(cx)
-            .selections
-            .disjoint_anchor_ranges()
-            .collect()
-    }
-
-    pub(crate) fn stage_or_unstage_selected_hunks(
-        &mut self,
-        stage: bool,
-        move_to_next: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let editor = self.editor.read(cx).rhs_editor().clone();
-        let ranges = self.hunk_action_ranges(cx);
-        // Route through the editor's delegated stage path, the same path taken
-        // by the hunk buttons (on either side of a split) and the keyboard.
-        // For staging, dirty buffers are saved first, exactly as they are when
-        // staging from the uncommitted diff or a normal editor.
-        editor.update(cx, |editor, cx| {
-            editor.stage_or_unstage_diff_hunks(stage, ranges, window, cx);
-        });
-        if move_to_next {
-            editor
-                .focus_handle(cx)
-                .dispatch_action(&GoToHunk, window, cx);
-        }
-    }
-
-    pub(crate) fn restore_selected_hunks(
-        &mut self,
-        move_to_next: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let editor = self.editor.read(cx).rhs_editor().clone();
-        let ranges = self.hunk_action_ranges(cx);
-        editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let hunks: Vec<_> = editor.diff_hunks_in_ranges(&ranges, &snapshot).collect();
-            if !hunks.is_empty() {
-                editor.apply_restore(hunks, window, cx);
-            }
-        });
-        if move_to_next {
-            editor
-                .focus_handle(cx)
-                .dispatch_action(&GoToHunk, window, cx);
-        }
     }
 
     fn handle_editor_event(
