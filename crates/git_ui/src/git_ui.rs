@@ -106,8 +106,6 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(|workspace: &mut Workspace, _, cx| {
         ProjectDiff::register(workspace, cx);
-        staged_diff::StagedDiff::register(workspace, cx);
-        unstaged_diff::UnstagedDiff::register(workspace, cx);
         branch_diff::BranchDiff::register(workspace, cx);
         CommitModal::register(workspace);
         git_panel::register(workspace);
