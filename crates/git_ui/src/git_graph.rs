@@ -1,4 +1,6 @@
-pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
+pub use crate::commit_context_menu::{
+    CopyCommitSha, CopyCommitTag, CreateBranchAtCommit, OpenCommitView,
+};
 use crate::{
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
     commit_tooltip::CommitAvatar,
@@ -4855,6 +4857,29 @@ impl GitGraph {
             )
             .into_any_element()
     }
+
+    fn show_create_branch_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_entry_idx else {
+            return;
+        };
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        let commit_sha = commit.data.sha.to_string().into();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                CreateBranchAtCommitModal::new(graph, repository, commit_sha, window, cx)
+            });
+        });
+    }
 }
 
 impl PickerDelegate for BranchFilterPickerDelegate {
@@ -5463,6 +5488,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &ToggleFirstParentOnly, _window, cx| {
                 this.update_graph_settings(|settings| settings.first_parent_only ^= true, cx);
             }))
+            .on_action(cx.listener(|this, _: &CreateBranchAtCommit, window, cx| {
+                this.show_create_branch_modal(window, cx);
+            }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
@@ -5500,6 +5528,100 @@ impl Render for GitGraph {
 }
 
 impl EventEmitter<ItemEvent> for GitGraph {}
+
+struct CreateBranchAtCommitModal {
+    graph: WeakEntity<GitGraph>,
+    repository: Entity<Repository>,
+    commit_sha: SharedString,
+    editor: Entity<Editor>,
+}
+
+impl CreateBranchAtCommitModal {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        repository: Entity<Repository>,
+        commit_sha: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Branch name", window, cx);
+            editor
+        });
+
+        Self {
+            graph,
+            repository,
+            commit_sha,
+            editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let branch_name = self.editor.read(cx).text(cx).trim().to_string();
+        if branch_name.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let rx = self.repository.update(cx, |repository, _| {
+            repository.create_branch_at(self.commit_sha.to_string(), branch_name)
+        });
+        let graph = self.graph.clone();
+        cx.spawn(async move |_, cx| match rx.await {
+            Ok(Ok(())) => {
+                graph
+                    .update(cx, |graph, cx| {
+                        graph.invalidate_state(cx);
+                        graph.fetch_initial_graph_data(cx);
+                    })
+                    .ok();
+            }
+            Ok(Err(error)) => log::error!("failed to create branch: {error:?}"),
+            Err(_) => log::error!("branch creation was canceled"),
+        })
+        .detach();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CreateBranchAtCommitModal {}
+impl ModalView for CreateBranchAtCommitModal {}
+impl Focusable for CreateBranchAtCommitModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for CreateBranchAtCommitModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("CreateBranchAtCommitModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Create Branch at {}", self.commit_sha))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
 
 impl Focusable for GitGraph {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
