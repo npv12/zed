@@ -355,6 +355,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &git::CreateTagAtHead, window, cx| {
             create_tag_at_head(workspace, window, cx);
         });
+        workspace.register_action(|workspace, _: &git::CreateBranchAtHead, window, cx| {
+            create_branch_at_head(workspace, window, cx);
+        });
         workspace.register_action(|workspace, _: &git::CopyBranchName, _, cx| {
             copy_branch_name(workspace, cx);
         });
@@ -694,6 +697,148 @@ pub(crate) fn create_tag_at_commit(
     workspace.toggle_modal(window, cx, |window, cx| {
         CreateTagModal::new(commit, at_head, repo, workspace_handle, window, cx)
     });
+}
+
+fn create_branch_at_head(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
+        return;
+    };
+    let Some(commit) = repo
+        .read(cx)
+        .head_commit
+        .as_ref()
+        .and_then(|commit| Oid::try_from(commit.sha.as_ref()).ok())
+    else {
+        return;
+    };
+    create_branch_at_commit(commit, true, repo, workspace, window, cx);
+}
+
+pub(crate) fn create_branch_at_commit(
+    commit: Oid,
+    at_head: bool,
+    repo: Entity<Repository>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let workspace_handle = cx.weak_entity();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        CreateBranchAtCommitModal::new(commit, at_head, repo, workspace_handle, window, cx)
+    });
+}
+
+struct CreateBranchAtCommitModal {
+    commit: Oid,
+    at_head: bool,
+    editor: Entity<Editor>,
+    repo: Entity<Repository>,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl CreateBranchAtCommitModal {
+    fn new(
+        commit: Oid,
+        at_head: bool,
+        repo: Entity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Branch name", window, cx);
+            editor
+        });
+        Self {
+            commit,
+            at_head,
+            editor,
+            repo,
+            workspace,
+        }
+    }
+
+    fn branch_target_commit_label(&self) -> String {
+        let short_sha = self.commit.display_short();
+
+        if self.at_head {
+            return format!("{short_sha} (HEAD)");
+        }
+
+        short_sha
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let branch_name = self.editor.read(cx).text(cx).trim().to_string();
+        if branch_name.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let repo = self.repo.clone();
+        let commit = self.commit.to_string();
+        let workspace = self.workspace.clone();
+        let success_message = format!(
+            "Created branch \"{branch_name}\" at {}",
+            self.branch_target_commit_label()
+        );
+        cx.spawn(async move |_, cx| {
+            repo.update(cx, |repo, _| repo.create_branch_at(commit, branch_name))
+                .await??;
+
+            workspace
+                .update(cx, |workspace, cx| {
+                    let toast = StatusToast::new(success_message, cx, |this, _| this);
+                    workspace.toggle_status_toast(toast, cx);
+                })
+                .log_err();
+            Ok(())
+        })
+        .detach_and_prompt_err("Failed to create branch", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CreateBranchAtCommitModal {}
+impl ModalView for CreateBranchAtCommitModal {}
+impl Focusable for CreateBranchAtCommitModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for CreateBranchAtCommitModal {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = format!("Create Branch at {}", self.branch_target_commit_label());
+        v_flex()
+            .key_context("CreateBranchAtCommitModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(Headline::new(title).size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
 }
 
 fn copy_branch_name(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
