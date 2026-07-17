@@ -1,4 +1,4 @@
-use crate::{commit_view::CommitView, create_tag_at_commit};
+use crate::{commit_view::CommitView, create_branch_at_commit, create_tag_at_commit};
 use git::Oid;
 use gpui::{Action, ClipboardItem, Entity, FocusHandle, SharedString, WeakEntity, Window, actions};
 use project::{GIT_COMMAND_TASK_TAG, git_store::Repository};
@@ -143,6 +143,26 @@ pub(crate) fn commit_context_menu(
                         })
                         .log_err();
                 }
+            })
+            .when(ref_name.is_none(), |menu| {
+                menu.separator().entry("Create Branch…", None, {
+                    let repository = repository.clone();
+                    let workspace = workspace.clone();
+                    move |window, cx| {
+                        let Some(repository) =
+                            repository.as_ref().and_then(WeakEntity::upgrade)
+                        else {
+                            return;
+                        };
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                create_branch_at_commit(
+                                    sha, false, repository, workspace, window, cx,
+                                );
+                            })
+                            .log_err();
+                    }
+                })
             })
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
                 menu.entry("Show in Git Graph", None, move |window, cx| {
