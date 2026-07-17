@@ -1,0 +1,100 @@
+name: release-npv12
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+on:
+  push:
+    tags:
+    - v*
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (e.g., v0.1.0)
+        required: true
+permissions:
+  contents: write
+jobs:
+  bundle_mac_aarch64:
+    if: github.repository_owner == 'npv12'
+    runs-on: macos-latest
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+    - name: checkout_repo
+      uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        clean: false
+    - name: setup_rust
+      uses: dtolnay/rust-toolchain@stable
+    - name: setup_node
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+      with:
+        node-version: '24'
+        check-latest: true
+    - name: install_cmake
+      run: brew install cmake
+    - name: clear_target_dir_if_large
+      run: ./script/clear-target-dir-if-larger-than 10 5
+    - name: bundle_mac
+      run: ./script/bundle-mac aarch64-apple-darwin
+    - name: upload_dmg
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: Zed-aarch64.dmg
+        path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+        if-no-files-found: error
+    - name: upload_remote_server
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: zed-remote-server-macos-aarch64.gz
+        path: target/zed-remote-server-macos-aarch64.gz
+        if-no-files-found: error
+  create_release:
+    needs: bundle_mac_aarch64
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      with:
+        fetch-depth: 0
+    - name: download_dmg
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: Zed-aarch64.dmg
+        path: ./artifacts/
+    - name: download_remote_server
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: zed-remote-server-macos-aarch64.gz
+        path: ./artifacts/
+    - name: set_release_tag
+      id: tag
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+        else
+          echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+        fi
+    - name: create_tag_if_workflow_dispatch
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        git tag "${{ steps.tag.outputs.tag }}"
+        git push origin "${{ steps.tag.outputs.tag }}"
+    - name: create_release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG="${{ steps.tag.outputs.tag }}"
+        if gh release view "$TAG" --repo="${{ github.repository }}" > /dev/null 2>&1; then
+          echo "Release $TAG already exists — uploading assets"
+          gh release upload "$TAG" ./artifacts/* --repo="${{ github.repository }}"
+        else
+          echo "Creating release $TAG"
+          gh release create "$TAG" \
+            ./artifacts/* \
+            --repo="${{ github.repository }}" \
+            --generate-notes \
+            --title="$TAG" \
+            --draft
+        fi
