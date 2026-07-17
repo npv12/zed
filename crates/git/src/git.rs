@@ -147,6 +147,8 @@ actions!(
         CopyBranchName,
         /// Creates a tag at HEAD.
         CreateTagAtHead,
+        /// Creates a branch at HEAD.
+        CreateBranchAtHead,
     ]
 );
 
