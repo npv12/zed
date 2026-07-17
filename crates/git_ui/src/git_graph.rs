@@ -5450,6 +5450,7 @@ impl GitGraph {
             })
             .into_any_element()
     }
+
 }
 
 impl PickerDelegate for BranchFilterPickerDelegate {
