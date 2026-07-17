@@ -3070,8 +3070,35 @@ impl GitPanel {
         }
     }
 
-    pub fn stage_all(&mut self, _: &StageAll, _window: &mut Window, cx: &mut Context<Self>) {
-        self.change_all_files_stage(true, cx);
+    pub fn stage_all(&mut self, _: &StageAll, window: &mut Window, cx: &mut Context<Self>) {
+        let has_conflicts = {
+            let cx: &App = cx;
+            self.entries.iter().any(|entry| {
+                entry
+                    .status_entry()
+                    .is_some_and(|e| self.git_entry_has_conflict_markers(e, cx))
+            })
+        };
+        if has_conflicts {
+            cx.spawn_in(window, async move |this, cx| {
+                let prompt = cx.prompt(
+                    PromptLevel::Warning,
+                    "Stage all with unresolved conflicts?",
+                    Some("Some files still have merge conflicts that have not been resolved."),
+                    &["Stage All", "Cancel"],
+                );
+                if prompt.await != Ok(0) {
+                    return;
+                }
+                this.update(cx, |this, cx| {
+                    this.change_all_files_stage(true, cx);
+                })
+                .ok();
+            })
+            .detach();
+        } else {
+            self.change_all_files_stage(true, cx);
+        }
     }
 
     pub fn unstage_all(&mut self, _: &UnstageAll, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3082,7 +3109,7 @@ impl GitPanel {
         &mut self,
         entry: &GitListEntry,
         intent: StageIntent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(active_repository) = self.active_repository.clone() else {
@@ -3167,7 +3194,7 @@ impl GitPanel {
             self.set_bulk_staging_anchor(anchor, cx);
         }
 
-        self.change_file_stage(stage, repo_paths, cx);
+        self.change_file_stage_with_conflict_warning(stage, repo_paths, window, cx);
     }
 
     fn change_file_stage(
@@ -3211,6 +3238,72 @@ impl GitPanel {
             }
         })
         .detach();
+    }
+
+    /// Checks whether a file's content actually contains unresolved merge
+    /// conflict markers (`<<<<<<< ` / `>>>>>>> `), as opposed to relying on
+    /// git's `FileStatus::is_conflicted()` which only reflects whether `git add`
+    /// has been run on the file.
+    fn git_entry_has_conflict_markers(&self, entry: &GitStatusEntry, cx: &App) -> bool {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return false;
+        };
+        let repo = repo.read(cx);
+        let abs_path = repo
+            .snapshot()
+            .work_directory_abs_path
+            .join(entry.repo_path.as_std_path());
+        match std::fs::read_to_string(&abs_path) {
+            Ok(content) => {
+                let mut in_conflict = false;
+                for line in content.lines() {
+                    if line.starts_with("<<<<<<< ") {
+                        in_conflict = true;
+                    } else if in_conflict && line.starts_with(">>>>>>> ") {
+                        return true;
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn change_file_stage_with_conflict_warning(
+        &mut self,
+        stage: bool,
+        entries: Vec<GitStatusEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if stage {
+            let has_conflicts = {
+                let cx: &App = cx;
+                entries
+                    .iter()
+                    .any(|e| self.git_entry_has_conflict_markers(e, cx))
+            };
+            if has_conflicts {
+                cx.spawn_in(window, async move |this, cx| {
+                    let prompt = cx.prompt(
+                        PromptLevel::Warning,
+                        "Stage file with unresolved conflicts?",
+                        Some("This file still has merge conflicts that have not been resolved."),
+                        &["Stage", "Cancel"],
+                    );
+                    if prompt.await != Ok(0) {
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        this.change_file_stage(stage, entries, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+        }
+        self.change_file_stage(stage, entries, cx);
     }
 
     pub fn total_staged_count(&self) -> usize {
@@ -3376,21 +3469,21 @@ impl GitPanel {
         self.stage_bulk(index, stage, cx);
     }
 
-    fn stage_selected(&mut self, _: &git::StageFile, _window: &mut Window, cx: &mut Context<Self>) {
+    fn stage_selected(&mut self, _: &git::StageFile, window: &mut Window, cx: &mut Context<Self>) {
         let to_stage = self
             .effective_status_entries()
             .into_iter()
             .filter(|entry| entry.staging != StageStatus::Staged)
             .collect::<Vec<_>>();
         if !to_stage.is_empty() {
-            self.change_file_stage(true, to_stage, cx);
+            self.change_file_stage_with_conflict_warning(true, to_stage, window, cx);
         }
     }
 
     fn unstage_selected(
         &mut self,
         _: &git::UnstageFile,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let to_unstage = self
@@ -3399,7 +3492,7 @@ impl GitPanel {
             .filter(|entry| entry.staging != StageStatus::Unstaged)
             .collect::<Vec<_>>();
         if !to_unstage.is_empty() {
-            self.change_file_stage(false, to_unstage, cx);
+            self.change_file_stage_with_conflict_warning(false, to_unstage, window, cx);
         }
     }
 
@@ -10957,9 +11050,16 @@ mod tests {
                 .expect("conflict entry should exist")
         });
 
-        panel.update_in(&mut cx, |panel, _window, cx| {
-            panel.change_file_stage(true, vec![conflict_entry.clone()], cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.change_file_stage_with_conflict_warning(
+                true,
+                vec![conflict_entry.clone()],
+                window,
+                cx,
+            );
         });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Stage");
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _| {
