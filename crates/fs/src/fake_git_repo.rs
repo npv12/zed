@@ -933,6 +933,15 @@ impl GitRepository for FakeGitRepository {
         })
     }
 
+    fn create_tag(
+        &self,
+        _sha: String,
+        _name: String,
+        _message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
             if !state.branches.remove(&branch) {
