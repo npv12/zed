@@ -1,4 +1,4 @@
-pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView};
+pub use crate::commit_context_menu::{CopyCommitSha, CopyCommitTag, OpenCommitView, RenameBranch};
 use crate::{
     commit_context_menu::{
         CUSTOM_GIT_COMMANDS_DOCS_SLUG, CommitContextMenuData, CommitContextMenuSource,
@@ -5445,6 +5445,26 @@ impl GitGraph {
             .into_any_element()
     }
 
+    fn show_rename_branch_modal(
+        &mut self,
+        branch_name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                RenameBranchModal::new(repository, branch_name, graph, window, cx)
+            });
+        });
+    }
 }
 
 impl PickerDelegate for BranchFilterPickerDelegate {
@@ -6093,6 +6113,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &ToggleFirstParentOnly, _window, cx| {
                 this.update_graph_settings(|settings| settings.first_parent_only ^= true, cx);
             }))
+            .on_action(cx.listener(|this, action: &RenameBranch, window, cx| {
+                this.show_rename_branch_modal(action.name.clone(), window, cx);
+            }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
@@ -6130,6 +6153,100 @@ impl Render for GitGraph {
 }
 
 impl EventEmitter<ItemEvent> for GitGraph {}
+
+struct RenameBranchModal {
+    repository: Entity<Repository>,
+    current_name: SharedString,
+    graph: WeakEntity<GitGraph>,
+    editor: Entity<Editor>,
+}
+
+impl RenameBranchModal {
+    fn new(
+        repository: Entity<Repository>,
+        branch_name: SharedString,
+        graph: WeakEntity<GitGraph>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(branch_name.clone(), window, cx);
+            editor
+        });
+
+        Self {
+            repository,
+            current_name: branch_name,
+            graph,
+            editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let new_name = self.editor.read(cx).text(cx).trim().to_string();
+        if new_name.is_empty() || new_name == self.current_name.as_ref() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let rx = self.repository.update(cx, |repository, _| {
+            repository.rename_branch(self.current_name.to_string(), new_name)
+        });
+        let graph = self.graph.clone();
+        cx.spawn(async move |_, cx| match rx.await {
+            Ok(Ok(())) => {
+                graph
+                    .update(cx, |graph, cx| {
+                        graph.invalidate_state(cx);
+                        graph.fetch_initial_graph_data(cx);
+                    })
+                    .ok();
+            }
+            Ok(Err(error)) => log::error!("failed to rename branch: {error:?}"),
+            Err(_) => log::error!("branch rename was canceled"),
+        })
+        .detach();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for RenameBranchModal {}
+impl ModalView for RenameBranchModal {}
+impl Focusable for RenameBranchModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for RenameBranchModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RenameBranchModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Rename Branch ({})", self.current_name))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
 
 impl Focusable for GitGraph {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
