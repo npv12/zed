@@ -649,6 +649,8 @@ actions!(
         ToggleSearchFilter,
         /// Toggles whether stash commits are shown in the git graph.
         ToggleShowStashes,
+        /// Toggles whether tags are shown in the git graph.
+        ToggleShowTags,
     ]
 );
 
@@ -1567,7 +1569,11 @@ impl GitGraph {
         self.fetch_initial_graph_data(cx);
     }
 
-    fn is_visible_ref_name(show_stashes: bool, ref_name: &str) -> bool {
+    fn is_visible_ref_name(show_stashes: bool, show_tags: bool, ref_name: &str) -> bool {
+        if !show_tags && (ref_name.starts_with("tag: ") || ref_name.starts_with("refs/tags/")) {
+            return false;
+        }
+
         if !show_stashes
             && (ref_name == "refs/stash"
                 || ref_name == "stash"
@@ -3154,6 +3160,7 @@ impl GitGraph {
             .child({
                 let filter_state = self.search_state.filter_matches;
                 let show_stashes = self.settings_dropdown_state.settings.show_stashes;
+                let show_tags = self.settings_dropdown_state.settings.show_tags;
                 PopoverMenu::new("git-graph-filter")
                     .trigger(
                         IconButton::new("git-graph-filter-button", IconName::Filter)
@@ -3204,6 +3211,26 @@ impl GitGraph {
                                 },
                                 |window, cx| {
                                     window.dispatch_action(ToggleShowStashes.boxed_clone(), cx);
+                                },
+                            )
+                            .custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-show-tags",
+                                        if show_tags {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("Show Tags")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(ToggleShowTags.boxed_clone(), cx);
                                 },
                             )
                         }))
@@ -3331,11 +3358,12 @@ impl GitGraph {
         let full_sha: SharedString = commit_entry.data.sha.to_string().into();
         let short_sha: SharedString = full_sha.chars().take(7).collect::<String>().into();
         let show_stashes = self.settings_dropdown_state.settings.show_stashes;
+        let show_tags = self.settings_dropdown_state.settings.show_tags;
         let ref_names: Vec<SharedString> = commit_entry
             .data
             .ref_names
             .iter()
-            .filter(|name| Self::is_visible_ref_name(show_stashes, name.as_ref()))
+            .filter(|name| Self::is_visible_ref_name(show_stashes, show_tags, name.as_ref()))
             .cloned()
             .collect();
 
@@ -3904,6 +3932,7 @@ impl GitGraph {
         let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
         let show_stashes = self.settings_dropdown_state.settings.show_stashes;
+        let show_tags = self.settings_dropdown_state.settings.show_tags;
         let hovered_entry_idx = self.hovered_entry_idx;
         let selected_entry_idx = self.selected_entry_idx;
         let context_menu_target_index = self
@@ -4130,12 +4159,9 @@ impl GitGraph {
 
                         let commit_x = lane_center_x(bounds, commit.lane as f32);
 
-                        if commit
-                            .data
-                            .ref_names
-                            .iter()
-                            .any(|name| Self::is_visible_ref_name(show_stashes, name.as_ref()))
-                        {
+                        if commit.data.ref_names.iter().any(|name| {
+                            Self::is_visible_ref_name(show_stashes, show_tags, name.as_ref())
+                        }) {
                             paint_dashed_connector(
                                 bounds.origin.x,
                                 commit_x - COMMIT_CIRCLE_RADIUS,
@@ -4271,6 +4297,7 @@ impl GitGraph {
                 .filter(|name| {
                     Self::is_visible_ref_name(
                         self.settings_dropdown_state.settings.show_stashes,
+                        self.settings_dropdown_state.settings.show_tags,
                         name.as_ref(),
                     )
                 })
@@ -5058,6 +5085,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(Self::toggle_search_filter))
             .on_action(cx.listener(|this, _: &ToggleShowStashes, _window, cx| {
                 this.update_graph_settings(|settings| settings.show_stashes ^= true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleShowTags, _window, cx| {
+                this.update_graph_settings(|settings| settings.show_tags ^= true, cx);
             }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
