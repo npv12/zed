@@ -23,6 +23,13 @@ actions!(
     ]
 );
 
+/// Renames a branch.
+#[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+#[action(namespace = git_graph)]
+pub struct RenameBranch {
+    pub name: SharedString,
+}
+
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
 const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 
@@ -89,8 +96,28 @@ pub(crate) fn commit_context_menu(
                 },
             )
             .when_some(ref_name.clone(), |menu, ref_name| {
-                menu.entry("Copy Ref Name", None, move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
+                let is_branch = !commit
+                    .tag_names
+                    .iter()
+                    .any(|t| t.as_ref() == ref_name.as_ref())
+                    && !ref_name.starts_with("stash");
+                let rename_label = format!("Rename Branch \"{ref_name}\"...");
+                menu.entry("Copy Ref Name", None, {
+                    let ref_name = ref_name.clone();
+                    move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(ref_name.to_string()));
+                    }
+                })
+                .when(is_branch, |menu| {
+                    let ref_name = ref_name.clone();
+                    menu.entry(rename_label, None, move |window, cx| {
+                        window.dispatch_action(
+                            Box::new(RenameBranch {
+                                name: ref_name.clone(),
+                            }),
+                            cx,
+                        );
+                    })
                 })
             })
             .when(ref_name.is_none(), |menu| {
