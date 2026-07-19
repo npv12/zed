@@ -817,6 +817,7 @@ pub struct GraphLogOptions {
     pub show_stashes: bool,
     pub show_tags: bool,
     pub show_remote_branches: bool,
+    pub include_reflog_commits: bool,
 }
 
 impl Default for GraphLogOptions {
@@ -825,18 +826,23 @@ impl Default for GraphLogOptions {
             show_stashes: true,
             show_tags: true,
             show_remote_branches: true,
+            include_reflog_commits: false,
         }
     }
 }
 
 impl GraphLogOptions {
     fn get_args<'a>(&self, source: &'a LogSource) -> Vec<Cow<'a, str>> {
+        let mut args = Vec::new();
+
+        if self.include_reflog_commits {
+            args.push(Cow::Borrowed("--reflog"));
+        }
+
         match source.base_source() {
             LogSource::All => {
-                let mut args = vec![
-                    Cow::Borrowed("--ignore-missing"),
-                    Cow::Borrowed("--branches"),
-                ];
+                args.push(Cow::Borrowed("--ignore-missing"));
+                args.push(Cow::Borrowed("--branches"));
                 if self.show_remote_branches {
                     args.push(Cow::Borrowed("--remotes"));
                 }
