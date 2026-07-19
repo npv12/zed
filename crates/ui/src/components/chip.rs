@@ -115,10 +115,19 @@ impl RenderOnce for Chip {
             .bg(bg_color)
             .overflow_hidden()
             .when_some(self.icon, |this, icon| {
-                this.child(
-                    Icon::new(icon)
-                        .size(IconSize::XSmall)
-                        .color(self.icon_color),
+                this.pl_0().child(
+                    h_flex()
+                        .border_r_1()
+                        .px_1()
+                        .bg(bg_color)
+                        .border_color(border_color)
+                        .rounded_l_sm()
+                        .items_center()
+                        .child(
+                            Icon::new(icon)
+                                .size(IconSize::XSmall)
+                                .color(self.icon_color),
+                        ),
                 )
             })
             .child(
