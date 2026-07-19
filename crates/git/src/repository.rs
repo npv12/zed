@@ -734,9 +734,68 @@ pub enum LogSource {
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
+    Filtered {
+        source: Box<LogSource>,
+        options: GraphLogOptions,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphLogOptions {
+    pub show_stashes: bool,
+}
+
+impl Default for GraphLogOptions {
+    fn default() -> Self {
+        Self { show_stashes: true }
+    }
+}
+
+impl GraphLogOptions {
+    fn get_args<'a>(&self, source: &'a LogSource) -> Vec<Cow<'a, str>> {
+        match source.base_source() {
+            LogSource::All => {
+                let mut args = vec![
+                    Cow::Borrowed("--ignore-missing"),
+                    Cow::Borrowed("--branches"),
+                    Cow::Borrowed("--remotes"),
+                    Cow::Borrowed("--tags"),
+                ];
+                if self.show_stashes {
+                    args.push(Cow::Borrowed("refs/stash"));
+                }
+                args.push(Cow::Borrowed("HEAD"));
+                args
+            }
+            source => source.get_args(),
+        }
+    }
 }
 
 impl LogSource {
+    pub fn base_source(&self) -> &LogSource {
+        match self {
+            LogSource::Filtered { source, .. } => source.base_source(),
+            source => source,
+        }
+    }
+
+    pub fn with_graph_options(self, options: GraphLogOptions) -> Self {
+        let source = match self {
+            LogSource::Filtered { source, .. } => *source,
+            source => source,
+        };
+
+        if options == GraphLogOptions::default() {
+            source
+        } else {
+            LogSource::Filtered {
+                source: Box::new(source),
+                options,
+            }
+        }
+    }
+
     fn get_args(&self) -> Vec<Cow<'_, str>> {
         match self {
             LogSource::All => vec![
@@ -744,6 +803,7 @@ impl LogSource {
                 Cow::Borrowed("--branches"),
                 Cow::Borrowed("--remotes"),
                 Cow::Borrowed("--tags"),
+                Cow::Borrowed("refs/stash"),
                 Cow::Borrowed("HEAD"),
             ],
             LogSource::Branch(branch) => vec![Cow::Borrowed(branch.as_str())],
@@ -753,6 +813,7 @@ impl LogSource {
                 Cow::Borrowed("--"),
                 Cow::Borrowed(path.as_unix_str()),
             ],
+            LogSource::Filtered { source, options } => options.get_args(source),
         }
     }
 }
