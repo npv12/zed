@@ -524,7 +524,8 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
 
-    GitCreateBranchAt git_create_branch_at = 494; // current max
+    GitCreateBranchAt git_create_branch_at = 494;
+    GitCreateTag git_create_tag = 495;  // current max
   }
 
   reserved 87 to 88;
