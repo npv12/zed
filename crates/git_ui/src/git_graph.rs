@@ -648,6 +648,8 @@ actions!(
         ToggleShowTags,
         /// Toggles whether remote branches are shown in the git graph.
         ToggleShowRemoteBranches,
+        /// Toggles whether reflog commits are included in the git graph.
+        ToggleReflogCommits,
     ]
 );
 
@@ -2848,6 +2850,8 @@ impl GitGraph {
                 let show_tags = self.settings_dropdown_state.settings.show_tags;
                 let show_remote_branches =
                     self.settings_dropdown_state.settings.show_remote_branches;
+                let include_reflog_commits =
+                    self.settings_dropdown_state.settings.include_reflog_commits;
                 PopoverMenu::new("git-graph-filter")
                     .trigger(
                         IconButton::new("git-graph-filter-button", IconName::Filter)
@@ -2941,6 +2945,26 @@ impl GitGraph {
                                         ToggleShowRemoteBranches.boxed_clone(),
                                         cx,
                                     );
+                                },
+                            )
+                            .custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-include-reflog-commits",
+                                        if include_reflog_commits {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("Include Reflog Commits")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(ToggleReflogCommits.boxed_clone(), cx);
                                 },
                             )
                         }))
@@ -4478,6 +4502,9 @@ impl Render for GitGraph {
                     );
                 }),
             )
+            .on_action(cx.listener(|this, _: &ToggleReflogCommits, _window, cx| {
+                this.update_graph_settings(|settings| settings.include_reflog_commits ^= true, cx);
+            }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
