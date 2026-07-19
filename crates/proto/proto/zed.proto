@@ -520,7 +520,8 @@ message Envelope {
     LspExtExpandAbbreviation lsp_ext_expand_abbreviation = 488;
     LspExtExpandAbbreviationResponse lsp_ext_expand_abbreviation_response = 489;
 
-    GitCreateBranchAt git_create_branch_at = 490; // current max
+    GitCreateBranchAt git_create_branch_at = 490;
+    GitCreateTag git_create_tag = 491;  // current max
   }
 
   reserved 87 to 88;
