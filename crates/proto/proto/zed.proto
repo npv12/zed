@@ -506,7 +506,8 @@ message Envelope {
     RefreshDocumentLinks refresh_document_links = 475;
     RefreshFoldingRanges refresh_folding_ranges = 476;
     RefreshDocumentSymbols refresh_document_symbols = 477;
-    GitCreateBranchAt git_create_branch_at = 478; // current max
+    GitCreateBranchAt git_create_branch_at = 478;
+    GitCreateTag git_create_tag = 479; // current max
   }
 
   reserved 87 to 88;

@@ -914,6 +914,12 @@ pub trait GitRepository: Send + Sync {
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
     fn create_branch_at(&self, sha: String, name: String) -> BoxFuture<'_, Result<()>>;
+    fn create_tag(
+        &self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>>;
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>>;
 
     fn delete_branch(
@@ -2427,6 +2433,29 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let git_binary = git_binary?;
                 git_binary.run(&["branch", &name, &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn create_tag(
+        &self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+                    git_binary
+                        .run(&["tag", "-a", &name, &sha, "-m", &message])
+                        .await?;
+                } else {
+                    git_binary.run(&["tag", &name, &sha]).await?;
+                }
                 anyhow::Ok(())
             })
             .boxed()
