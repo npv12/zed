@@ -647,6 +647,8 @@ actions!(
         ToggleShowRemoteBranches,
         /// Toggles whether reflog commits are included in the git graph.
         ToggleReflogCommits,
+        /// Toggles whether only first-parent history is shown in the git graph.
+        ToggleFirstParentOnly,
     ]
 );
 
@@ -2867,6 +2869,7 @@ impl GitGraph {
                     self.settings_dropdown_state.settings.show_remote_branches;
                 let include_reflog_commits =
                     self.settings_dropdown_state.settings.include_reflog_commits;
+                let first_parent_only = self.settings_dropdown_state.settings.first_parent_only;
                 PopoverMenu::new("git-graph-filter")
                     .trigger(
                         IconButton::new("git-graph-filter-button", IconName::Filter)
@@ -2980,6 +2983,26 @@ impl GitGraph {
                                 },
                                 |window, cx| {
                                     window.dispatch_action(ToggleReflogCommits.boxed_clone(), cx);
+                                },
+                            )
+                            .custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-first-parent-only",
+                                        if first_parent_only {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("First Parent Only")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(ToggleFirstParentOnly.boxed_clone(), cx);
                                 },
                             )
                         }))
@@ -4524,6 +4547,9 @@ impl Render for GitGraph {
             )
             .on_action(cx.listener(|this, _: &ToggleReflogCommits, _window, cx| {
                 this.update_graph_settings(|settings| settings.include_reflog_commits ^= true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFirstParentOnly, _window, cx| {
+                this.update_graph_settings(|settings| settings.first_parent_only ^= true, cx);
             }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
