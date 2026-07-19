@@ -15,7 +15,7 @@ use file_icons::FileIcons;
 use git::{
     BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
     parse_git_remote_url,
-    repository::{InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
+    repository::{GraphLogOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath, SearchCommitArgs},
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
@@ -584,6 +584,12 @@ impl SearchState {
     }
 }
 
+#[derive(Default)]
+struct SettingsDropdownState {
+    handle: PopoverMenuHandle<ContextMenu>,
+    settings: GraphLogOptions,
+}
+
 struct SplitState {
     visible_left_ratio: f32,
 }
@@ -640,6 +646,8 @@ actions!(
         ToggleChangedFilesView,
         /// Toggles filtering the graph to commits matching the search query.
         ToggleSearchFilter,
+        /// Toggles whether stash commits are shown in the git graph.
+        ToggleShowStashes,
     ]
 );
 
@@ -1271,7 +1279,7 @@ pub fn open_or_reuse_graph(
 ) {
     let existing = workspace.items_of_type::<GitGraph>(cx).find(|graph| {
         let graph = graph.read(cx);
-        graph.repo_id == repo_id && graph.log_source == log_source
+        graph.repo_id == repo_id && graph.log_source.base_source() == log_source.base_source()
     });
 
     let git_graph = if let Some(existing) = existing {
@@ -1532,7 +1540,7 @@ pub struct GitGraph {
     changed_files_expanded_dirs: HashMap<RepoPath, bool>,
     pending_select_sha: Option<Oid>,
     nav_history: Option<ItemNavHistory>,
-    filter_popover_handle: PopoverMenuHandle<ContextMenu>,
+    settings_dropdown_state: SettingsDropdownState,
 }
 
 impl GitGraph {
@@ -1543,6 +1551,38 @@ impl GitGraph {
         self.context_menu = None;
         cx.emit(ItemEvent::Edit);
         cx.notify();
+    }
+
+    fn update_graph_settings(
+        &mut self,
+        update: impl FnOnce(&mut GraphLogOptions),
+        cx: &mut Context<Self>,
+    ) {
+        let mut settings = self.settings_dropdown_state.settings;
+        update(&mut settings);
+
+        if settings == self.settings_dropdown_state.settings {
+            return;
+        }
+
+        self.settings_dropdown_state.settings = settings;
+        self.log_source = self.log_source.clone().with_graph_options(settings);
+        self.pending_select_sha = None;
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
+    fn is_visible_ref_name(show_stashes: bool, ref_name: &str) -> bool {
+        if !show_stashes
+            && (ref_name == "refs/stash"
+                || ref_name == "stash"
+                || ref_name.starts_with("stash@{")
+                || ref_name.contains("refs/stash"))
+        {
+            return false;
+        }
+
+        true
     }
 
     /// Computes the height of a single commit row in the git graph.
@@ -1614,7 +1654,7 @@ impl GitGraph {
     }
 
     fn is_path_history(&self) -> bool {
-        matches!(self.log_source, LogSource::Path(_))
+        matches!(self.log_source.base_source(), LogSource::Path(_))
     }
 
     fn is_column_visible(&self, col_idx: usize) -> bool {
@@ -1710,7 +1750,9 @@ impl GitGraph {
 
         let accent_colors = cx.theme().accents();
         let graph = GraphData::new(accent_colors_count(accent_colors));
-        let log_source = log_source.unwrap_or_default();
+        let base_log_source = log_source.unwrap_or_default();
+        let settings = GraphLogOptions::default();
+        let log_source = base_log_source.with_graph_options(settings);
         let log_order = LogOrder::default();
 
         cx.subscribe(&git_store, |this, _, event, cx| match event {
@@ -1737,7 +1779,7 @@ impl GitGraph {
             state
         });
 
-        let column_widths = if matches!(log_source, LogSource::Path(_)) {
+        let column_widths = if matches!(log_source.base_source(), LogSource::Path(_)) {
             cx.new(|_cx| {
                 RedistributableColumnsState::new(
                     4,
@@ -1771,7 +1813,7 @@ impl GitGraph {
         };
         let column_visibility = TableRow::from_element(
             false,
-            if matches!(log_source, LogSource::Path(_)) {
+            if matches!(log_source.base_source(), LogSource::Path(_)) {
                 TABLE_COLUMN_COUNT
             } else {
                 GRAPH_LAYOUT_TABLE_OFFSET + TABLE_COLUMN_COUNT
@@ -1842,7 +1884,7 @@ impl GitGraph {
             changed_files_expanded_dirs: HashMap::default(),
             pending_select_sha: None,
             nav_history: None,
-            filter_popover_handle: PopoverMenuHandle::default(),
+            settings_dropdown_state: SettingsDropdownState::default(),
         };
 
         this.fetch_initial_graph_data(cx);
@@ -1946,7 +1988,10 @@ impl GitGraph {
                     self.invalidate_state(cx);
                 }
             }
-            RepositoryEvent::StashEntriesChanged if self.log_source == LogSource::All => {
+            RepositoryEvent::StashEntriesChanged
+                if self.log_source.base_source() == &LogSource::All
+                    && self.settings_dropdown_state.settings.show_stashes =>
+            {
                 // Stash entries initial's scan id is 2, so we don't want to invalidate the graph before that
                 if repository.read(cx).scan_id > 2 {
                     self.pending_select_sha = None;
@@ -3026,7 +3071,7 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let is_path_history = matches!(self.log_source, LogSource::Path(_));
+        let is_path_history = matches!(self.log_source.base_source(), LogSource::Path(_));
         let columns: &[&str] = if is_path_history {
             &["Description", "Date", "Author", "Commit"]
         } else {
@@ -3128,6 +3173,7 @@ impl GitGraph {
             )
             .child({
                 let filter_state = self.search_state.filter_matches;
+                let show_stashes = self.settings_dropdown_state.settings.show_stashes;
                 PopoverMenu::new("git-graph-filter")
                     .trigger(
                         IconButton::new("git-graph-filter-button", IconName::Filter)
@@ -3137,7 +3183,7 @@ impl GitGraph {
                             .toggle_state(filter_state),
                     )
                     .anchor(Anchor::TopRight)
-                    .with_handle(self.filter_popover_handle.clone())
+                    .with_handle(self.settings_dropdown_state.handle.clone())
                     .menu(move |window, cx| {
                         Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
                             menu.custom_entry(
@@ -3158,6 +3204,26 @@ impl GitGraph {
                                 },
                                 |window, cx| {
                                     window.dispatch_action(ToggleSearchFilter.boxed_clone(), cx);
+                                },
+                            )
+                            .custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-show-stashes",
+                                        if show_stashes {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("Show Stashes")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(ToggleShowStashes.boxed_clone(), cx);
                                 },
                             )
                         }))
@@ -3284,7 +3350,14 @@ impl GitGraph {
 
         let full_sha: SharedString = commit_entry.data.sha.to_string().into();
         let short_sha: SharedString = full_sha.chars().take(7).collect::<String>().into();
-        let ref_names = commit_entry.data.ref_names.clone();
+        let show_stashes = self.settings_dropdown_state.settings.show_stashes;
+        let ref_names: Vec<SharedString> = commit_entry
+            .data
+            .ref_names
+            .iter()
+            .filter(|name| Self::is_visible_ref_name(show_stashes, name.as_ref()))
+            .cloned()
+            .collect();
 
         let head_branch_name: Option<SharedString> = repository
             .read(cx)
@@ -3862,6 +3935,7 @@ impl GitGraph {
 
         let mut lines: BTreeMap<usize, Vec<_>> = BTreeMap::new();
 
+        let show_stashes = self.settings_dropdown_state.settings.show_stashes;
         let hovered_entry_idx = self.hovered_entry_idx;
         let selected_entry_idx = self.selected_entry_idx;
         let context_menu_target_index = self
@@ -3924,7 +3998,13 @@ impl GitGraph {
 
                         let commit_x = lane_center_x(bounds, commit.lane as f32);
 
-                        if paint_ref_connectors && !commit.data.ref_names.is_empty() {
+                        if paint_ref_connectors
+                            && commit
+                                .data
+                                .ref_names
+                                .iter()
+                                .any(|name| Self::is_visible_ref_name(show_stashes, name.as_ref()))
+                        {
                             paint_dashed_connector(
                                 bounds.origin.x,
                                 commit_x - COMMIT_CIRCLE_RADIUS,
@@ -4212,14 +4292,25 @@ impl GitGraph {
             let Some(commit) = self.graph_data.commits.get(absolute_idx) else {
                 continue;
             };
-            if commit.data.ref_names.is_empty() {
+            let ref_names: Vec<SharedString> = commit
+                .data
+                .ref_names
+                .iter()
+                .filter(|name| {
+                    Self::is_visible_ref_name(
+                        self.settings_dropdown_state.settings.show_stashes,
+                        name.as_ref(),
+                    )
+                })
+                .cloned()
+                .collect();
+            if ref_names.is_empty() {
                 continue;
             }
 
             let visible_row_idx = absolute_idx - first_visible_row;
             let top = visible_row_idx as f32 * row_height - vertical_scroll_offset;
             let accent_color = accent_colors.color_for_index(commit.color_idx as u32);
-            let ref_names = commit.data.ref_names.clone();
 
             // When a commit carries multiple refs we only render a single badge
             // (preferring the checked-out branch, falling back to the first ref)
@@ -5004,6 +5095,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::toggle_changed_files_view))
             .on_action(cx.listener(Self::toggle_search_filter))
+            .on_action(cx.listener(|this, _: &ToggleShowStashes, _window, cx| {
+                this.update_graph_settings(|settings| settings.show_stashes ^= true, cx);
+            }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
@@ -5062,7 +5156,7 @@ impl Item for GitGraph {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
         });
-        let path_history_path = match &self.log_source {
+        let path_history_path = match self.log_source.base_source() {
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
             _ => None,
         };
@@ -5087,7 +5181,7 @@ impl Item for GitGraph {
     }
 
     fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
-        if let LogSource::Path(path) = &self.log_source {
+        if let LogSource::Path(path) = self.log_source.base_source() {
             return path
                 .as_ref()
                 .file_name()
@@ -5378,20 +5472,22 @@ mod persistence {
     pub const LOG_ORDER_REVERSE: i32 = 3;
 
     pub fn serialize_log_source_type(log_source: &LogSource) -> i32 {
-        match log_source {
+        match log_source.base_source() {
             LogSource::All => LOG_SOURCE_ALL,
             LogSource::Branch(_) => LOG_SOURCE_BRANCH,
             LogSource::Sha(_) => LOG_SOURCE_SHA,
             LogSource::Path(_) => LOG_SOURCE_PATH,
+            LogSource::Filtered { .. } => unreachable!(),
         }
     }
 
     pub fn serialize_log_source_value(log_source: &LogSource) -> Option<String> {
-        match log_source {
+        match log_source.base_source() {
             LogSource::All => None,
             LogSource::Branch(branch) => Some(branch.to_string()),
             LogSource::Sha(oid) => Some(oid.to_string()),
             LogSource::Path(path) => Some(path.as_unix_str().to_string()),
+            LogSource::Filtered { .. } => unreachable!(),
         }
     }
 
@@ -5441,7 +5537,7 @@ mod persistence {
     /// The bit each display column's hidden flag is stored in, indexed by display column.
     /// The refs column uses bit 5 for backward compatibility with previously saved masks.
     pub fn hidden_column_bits(log_source: &LogSource) -> &'static [usize] {
-        match log_source {
+        match log_source.base_source() {
             LogSource::Path(_) => &[0, 1, 2, 3],
             _ => &[5, 0, 1, 2, 3, 4],
         }
