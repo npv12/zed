@@ -502,7 +502,8 @@ message Envelope {
     GitAddPathToGitInfoExclude git_add_path_to_git_info_exclude = 471;
     LoadCommitTemplate load_commit_template = 472;
     LoadCommitTemplateResponse load_commit_template_response = 473;
-    GitCreateBranchAt git_create_branch_at = 474; // current max
+    GitCreateBranchAt git_create_branch_at = 474;
+    GitCreateTag git_create_tag = 475; // current max
   }
 
   reserved 87 to 88;
