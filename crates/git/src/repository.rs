@@ -713,6 +713,7 @@ pub enum LogSource {
 pub struct GraphLogOptions {
     pub show_stashes: bool,
     pub show_tags: bool,
+    pub show_remote_branches: bool,
 }
 
 impl Default for GraphLogOptions {
@@ -720,6 +721,7 @@ impl Default for GraphLogOptions {
         Self {
             show_stashes: true,
             show_tags: true,
+            show_remote_branches: true,
         }
     }
 }
@@ -731,8 +733,10 @@ impl GraphLogOptions {
                 let mut args = vec![
                     Cow::Borrowed("--ignore-missing"),
                     Cow::Borrowed("--branches"),
-                    Cow::Borrowed("--remotes"),
                 ];
+                if self.show_remote_branches {
+                    args.push(Cow::Borrowed("--remotes"));
+                }
                 if self.show_tags {
                     args.push(Cow::Borrowed("--tags"));
                 }
