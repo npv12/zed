@@ -776,6 +776,7 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_change_branch);
         client.add_entity_request_handler(Self::handle_create_branch);
         client.add_entity_request_handler(Self::handle_create_branch_at);
+        client.add_entity_request_handler(Self::handle_create_tag);
         client.add_entity_request_handler(Self::handle_rename_branch);
         client.add_entity_request_handler(Self::handle_create_remote);
         client.add_entity_request_handler(Self::handle_remove_remote);
@@ -3584,6 +3585,26 @@ impl GitStore {
         repository_handle
             .update(&mut cx, |repository_handle, _| {
                 repository_handle.create_branch_at(sha, branch_name)
+            })
+            .await??;
+
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_create_tag(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitCreateTag>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let sha = envelope.payload.sha;
+        let tag_name = envelope.payload.tag_name;
+        let message = envelope.payload.message;
+
+        repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.create_tag(sha, tag_name, message)
             })
             .await??;
 
@@ -8611,6 +8632,39 @@ impl Repository {
                                 repository_id: id.to_proto(),
                                 sha,
                                 branch_name: name,
+                            })
+                            .await?;
+
+                        Ok(())
+                    }
+                }
+            },
+        )
+    }
+
+    pub fn create_tag(
+        &mut self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        self.send_job(
+            "create_tag",
+            Some(format!("git tag {name} {sha}").into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.create_tag(sha, name, message).await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        client
+                            .request(proto::GitCreateTag {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                sha,
+                                tag_name: name,
+                                message,
                             })
                             .await?;
 
