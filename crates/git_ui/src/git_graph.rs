@@ -18,6 +18,7 @@ use git::{
         Branch, GraphLogOptions, InitialGraphCommitData, LogOrder, LogSource, RepoPath,
         SearchCommitArgs,
     },
+    stash::GitStash,
     status::{FileStatus, StatusCode, TrackedStatus},
 };
 use gpui::{
@@ -2156,6 +2157,20 @@ impl GitGraph {
         ref_name == "refs/stash" || ref_name == "stash" || ref_name.starts_with("stash@{")
     }
 
+    fn display_ref_name(
+        ref_name: &SharedString,
+        sha: Oid,
+        stash_entries: &GitStash,
+    ) -> SharedString {
+        if Self::is_stash_ref_name(ref_name)
+            && let Some(entry) = stash_entries.entries.iter().find(|entry| entry.oid == sha)
+        {
+            return format!("stash@{{{}}}", entry.index).into();
+        }
+
+        ref_name.clone()
+    }
+
     fn is_remote_branch_ref_name(ref_name: &str) -> bool {
         ref_name.starts_with("refs/remotes/")
     }
@@ -2633,9 +2648,10 @@ impl GitGraph {
         Some(SharedString::from(name.to_string()))
     }
 
-    /// Renders a ref chip for the commit at `commit_idx`. Chips get a
-    /// right-click handler that opens a ref-specific context menu, so that
-    /// custom commands can be resolved against the clicked ref.
+    /// Renders a ref chip for the commit at `commit_idx`. Chips that name a ref
+    /// (branch, remote ref, or tag) get a right-click handler that opens a
+    /// ref-specific context menu, so that custom commands can be resolved
+    /// against the clicked ref.
     fn render_ref_chip(
         &self,
         name: SharedString,
@@ -2645,6 +2661,15 @@ impl GitGraph {
         background: gpui::Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let is_tag = name.starts_with("tag: ");
+        let is_stash = Self::is_stash_ref_name(&name);
+        let label: SharedString = if is_tag {
+            name.trim_start_matches("tag: ").to_string().into()
+        } else if name.starts_with("HEAD -> ") {
+            name.trim_start_matches("HEAD -> ").to_string().into()
+        } else {
+            name.clone()
+        };
         let tooltip_text = name.clone();
         let chip_id = SharedString::from(format!("git-graph-ref-chip-{commit_idx}-{name}"));
 
@@ -2653,17 +2678,32 @@ impl GitGraph {
             .min_w_0()
             .overflow_hidden()
             .child(
-                Chip::new(name.clone())
+                Chip::new(label)
                     .label_size(LabelSize::Small)
                     .truncate()
+                    .icon(if is_head {
+                        IconName::Check
+                    } else if is_tag {
+                        IconName::GitTag
+                    } else if is_stash {
+                        IconName::BoxOpen
+                    } else {
+                        IconName::GitBranch
+                    })
                     .map(|chip| {
                         if is_head {
-                            chip.icon(IconName::Check)
-                                .bg_color(background.blend(accent_color.opacity(0.25)))
+                            chip.bg_color(background.blend(accent_color.opacity(0.25)))
                                 .border_color(accent_color.opacity(0.5))
+                        } else if is_tag {
+                            chip.icon_color(Color::Custom(accent_color))
+                                .bg_color(background.blend(accent_color.opacity(0.12)))
+                                .border_color(accent_color.opacity(0.4))
+                        } else if is_stash {
+                            chip.icon_color(Color::Custom(accent_color))
+                                .bg_color(background.blend(accent_color.opacity(0.18)))
+                                .border_color(accent_color.opacity(0.4))
                         } else {
-                            chip.icon(IconName::GitBranch)
-                                .icon_color(Color::Custom(accent_color))
+                            chip.icon_color(Color::Custom(accent_color))
                                 .bg_color(background.blend(accent_color.opacity(0.08)))
                                 .border_color(accent_color.opacity(0.25))
                         }
@@ -4106,12 +4146,16 @@ impl GitGraph {
             .cloned()
             .collect();
 
-        let head_branch_name: Option<SharedString> = repository
-            .read(cx)
-            .snapshot()
+        let repository_snapshot = repository.read(cx).snapshot();
+        let head_branch_name: Option<SharedString> = repository_snapshot
             .branch
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
+        let stash_entries = repository_snapshot.stash_entries;
+        let display_ref_names = ref_names
+            .iter()
+            .map(|name| Self::display_ref_name(name, commit_entry.data.sha, &stash_entries))
+            .collect::<Vec<_>>();
 
         let accent_colors = cx.theme().accents();
         let accent_color = accent_colors
@@ -4289,9 +4333,9 @@ impl GitGraph {
                                         .size(LabelSize::Small),
                                 ),
                         )
-                        .children((!ref_names.is_empty()).then(|| {
+                        .children((!display_ref_names.is_empty()).then(|| {
                             h_flex().gap_1().flex_wrap().justify_center().children(
-                                ref_names.iter().map(|name| {
+                                display_ref_names.iter().map(|name| {
                                     let is_head =
                                         Self::is_head_ref(name.as_ref(), &head_branch_name);
                                     self.render_ref_chip(
