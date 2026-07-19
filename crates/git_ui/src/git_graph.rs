@@ -1,5 +1,5 @@
 pub use crate::commit_context_menu::{
-    CopyCommitSha, CopyCommitTag, CreateBranchAtCommit, OpenCommitView,
+    AddTag, CopyCommitSha, CopyCommitTag, CreateBranchAtCommit, OpenCommitView,
 };
 use crate::{
     commit_context_menu::{CommitContextMenuData, CommitContextMenuSource, commit_context_menu},
@@ -4870,11 +4870,33 @@ impl GitGraph {
             return;
         };
 
-        let graph = cx.weak_entity();
         let commit_sha = commit.data.sha.to_string().into();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                CreateBranchAtCommitModal::new(graph, repository, commit_sha, window, cx)
+                CreateBranchAtCommitModal::new(repository, commit_sha, window, cx)
+            });
+        });
+    }
+
+    fn show_add_tag_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_entry_idx else {
+            return;
+        };
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let commit_sha = commit.data.sha.to_string().into();
+        let graph = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                AddTagModal::new(repository, commit_sha, graph, window, cx)
             });
         });
     }
@@ -5489,6 +5511,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &CreateBranchAtCommit, window, cx| {
                 this.show_create_branch_modal(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &AddTag, window, cx| {
+                this.show_add_tag_modal(window, cx);
+            }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
@@ -5528,7 +5553,6 @@ impl Render for GitGraph {
 impl EventEmitter<ItemEvent> for GitGraph {}
 
 struct CreateBranchAtCommitModal {
-    graph: WeakEntity<GitGraph>,
     repository: Entity<Repository>,
     commit_sha: SharedString,
     editor: Entity<Editor>,
@@ -5536,7 +5560,6 @@ struct CreateBranchAtCommitModal {
 
 impl CreateBranchAtCommitModal {
     fn new(
-        graph: WeakEntity<GitGraph>,
         repository: Entity<Repository>,
         commit_sha: SharedString,
         window: &mut Window,
@@ -5549,7 +5572,6 @@ impl CreateBranchAtCommitModal {
         });
 
         Self {
-            graph,
             repository,
             commit_sha,
             editor,
@@ -5618,6 +5640,117 @@ impl Render for CreateBranchAtCommitModal {
                     ),
             )
             .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+struct AddTagModal {
+    repository: Entity<Repository>,
+    commit_sha: SharedString,
+    graph: WeakEntity<GitGraph>,
+    name_editor: Entity<Editor>,
+    message_editor: Entity<Editor>,
+}
+
+impl AddTagModal {
+    fn new(
+        repository: Entity<Repository>,
+        commit_sha: SharedString,
+        graph: WeakEntity<GitGraph>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Tag name", window, cx);
+            editor
+        });
+        let message_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Optional annotation message", window, cx);
+            editor
+        });
+
+        Self {
+            repository,
+            commit_sha,
+            graph,
+            name_editor,
+            message_editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let tag_name = self.name_editor.read(cx).text(cx).trim().to_string();
+        if tag_name.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let message = self.message_editor.read(cx).text(cx).trim().to_string();
+        let message = (!message.is_empty()).then_some(message);
+        let rx = self.repository.update(cx, |repository, _| {
+            repository.create_tag(self.commit_sha.to_string(), tag_name, message)
+        });
+        let graph = self.graph.clone();
+        cx.spawn(async move |_, cx| match rx.await {
+            Ok(Ok(())) => {
+                graph
+                    .update(cx, |graph, cx| {
+                        graph.invalidate_state(cx);
+                        graph.fetch_initial_graph_data(cx);
+                    })
+                    .ok();
+            }
+            Ok(Err(error)) => log::error!("failed to create tag: {error:?}"),
+            Err(_) => log::error!("tag creation was canceled"),
+        })
+        .detach();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for AddTagModal {}
+impl ModalView for AddTagModal {}
+impl Focusable for AddTagModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name_editor.focus_handle(cx)
+    }
+}
+
+impl Render for AddTagModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("AddTagModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitTag).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Add Tag at {}", self.commit_sha))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_3()
+                    .pb_3()
+                    .gap_2()
+                    .w_full()
+                    .child(self.name_editor.clone())
+                    .child(self.message_editor.clone()),
+            )
     }
 }
 

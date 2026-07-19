@@ -357,6 +357,15 @@ message GitCreateBranchAt {
   string branch_name = 5;
 }
 
+message GitCreateTag {
+  uint64 project_id = 1;
+  reserved 2;
+  uint64 repository_id = 3;
+  string sha = 4;
+  string tag_name = 5;
+  optional string message = 6;
+}
+
 // Move to `git.proto` once collab's min version is >=0.171.0.
 message StatusEntry {
   string repo_path = 1;
