@@ -644,6 +644,8 @@ actions!(
         ToggleSearchFilter,
         /// Toggles whether stash commits are shown in the git graph.
         ToggleShowStashes,
+        /// Toggles whether tags are shown in the git graph.
+        ToggleShowTags,
     ]
 );
 
@@ -1417,6 +1419,12 @@ impl GitGraph {
     }
 
     fn is_visible_ref_name(&self, ref_name: &str) -> bool {
+        if !self.settings_dropdown_state.settings.show_tags
+            && (ref_name.starts_with("tag: ") || ref_name.starts_with("refs/tags/"))
+        {
+            return false;
+        }
+
         if !self.settings_dropdown_state.settings.show_stashes
             && (ref_name == "refs/stash"
                 || ref_name == "stash"
@@ -2825,6 +2833,7 @@ impl GitGraph {
             .child({
                 let filter_state = self.search_state.filter_matches;
                 let show_stashes = self.settings_dropdown_state.settings.show_stashes;
+                let show_tags = self.settings_dropdown_state.settings.show_tags;
                 PopoverMenu::new("git-graph-filter")
                     .trigger(
                         IconButton::new("git-graph-filter-button", IconName::Filter)
@@ -2875,6 +2884,26 @@ impl GitGraph {
                                 },
                                 |window, cx| {
                                     window.dispatch_action(ToggleShowStashes.boxed_clone(), cx);
+                                },
+                            )
+                            .custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-show-tags",
+                                        if show_tags {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("Show Tags")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(ToggleShowTags.boxed_clone(), cx);
                                 },
                             )
                         }))
@@ -4400,6 +4429,9 @@ impl Render for GitGraph {
             .on_action(cx.listener(Self::toggle_search_filter))
             .on_action(cx.listener(|this, _: &ToggleShowStashes, _window, cx| {
                 this.update_graph_settings(|settings| settings.show_stashes ^= true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleShowTags, _window, cx| {
+                this.update_graph_settings(|settings| settings.show_tags ^= true, cx);
             }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
