@@ -714,11 +714,15 @@ pub enum LogSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GraphLogOptions {
     pub show_stashes: bool,
+    pub show_tags: bool,
 }
 
 impl Default for GraphLogOptions {
     fn default() -> Self {
-        Self { show_stashes: true }
+        Self {
+            show_stashes: true,
+            show_tags: true,
+        }
     }
 }
 
@@ -730,8 +734,10 @@ impl GraphLogOptions {
                     Cow::Borrowed("--ignore-missing"),
                     Cow::Borrowed("--branches"),
                     Cow::Borrowed("--remotes"),
-                    Cow::Borrowed("--tags"),
                 ];
+                if self.show_tags {
+                    args.push(Cow::Borrowed("--tags"));
+                }
                 if self.show_stashes {
                     args.push(Cow::Borrowed("refs/stash"));
                 }
