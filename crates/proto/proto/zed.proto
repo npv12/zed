@@ -510,7 +510,8 @@ message Envelope {
     BlameBufferAtRevisionResponse blame_buffer_at_revision_response = 479;
     GetFilePermalink get_file_permalink = 480;
     GetFilePermalinkResponse get_file_permalink_response = 481;
-    GitCreateBranchAt git_create_branch_at = 482; // current max
+    GitCreateBranchAt git_create_branch_at = 482;
+    GitCreateTag git_create_tag = 483; // current max
   }
 
   reserved 87 to 88;
