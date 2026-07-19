@@ -723,6 +723,7 @@ pub struct GraphLogOptions {
     pub show_tags: bool,
     pub show_remote_branches: bool,
     pub include_reflog_commits: bool,
+    pub first_parent_only: bool,
 }
 
 impl Default for GraphLogOptions {
@@ -732,6 +733,7 @@ impl Default for GraphLogOptions {
             show_tags: true,
             show_remote_branches: true,
             include_reflog_commits: false,
+            first_parent_only: false,
         }
     }
 }
@@ -742,6 +744,10 @@ impl GraphLogOptions {
 
         if self.include_reflog_commits {
             args.push(Cow::Borrowed("--reflog"));
+        }
+
+        if self.first_parent_only {
+            args.push(Cow::Borrowed("--first-parent"));
         }
 
         match source.base_source() {
