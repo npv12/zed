@@ -501,6 +501,7 @@ message Envelope {
     GitAddPathToGitignore git_add_path_to_gitignore = 470;
     GitAddPathToGitInfoExclude git_add_path_to_git_info_exclude = 471;
     GitCreateBranchAt git_create_branch_at = 472;
+    GitCreateTag git_create_tag = 473;
   }
 
   reserved 87 to 88;

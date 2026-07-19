@@ -18,6 +18,8 @@ actions!(
         OpenCommitView,
         /// Creates a branch at the selected commit.
         CreateBranchAtCommit,
+        /// Adds a tag at the selected commit.
+        AddTag,
     ]
 );
 
@@ -131,10 +133,14 @@ pub(crate) fn commit_context_menu(
                     }
                 })
             })
-            .when(ref_name.is_none(), |menu| {
-                menu.separator()
-                    .action("Create Branch...", CreateBranchAtCommit.boxed_clone())
-            })
+            .when(ref_name.is_none(), |menu| menu.separator())
+            .when(
+                ref_name.is_none() && source == CommitContextMenuSource::GitGraph,
+                |menu| {
+                    menu.action("Create Branch...", CreateBranchAtCommit.boxed_clone())
+                        .action("Add Tag...", AddTag.boxed_clone())
+                },
+            )
             .when(source == CommitContextMenuSource::GitPanel, |menu| {
                 menu.entry("Show in Git Graph", None, move |window, cx| {
                     window.dispatch_action(
