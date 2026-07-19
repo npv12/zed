@@ -651,6 +651,8 @@ actions!(
         ToggleShowStashes,
         /// Toggles whether tags are shown in the git graph.
         ToggleShowTags,
+        /// Toggles whether remote branches are shown in the git graph.
+        ToggleShowRemoteBranches,
     ]
 );
 
@@ -1569,8 +1571,17 @@ impl GitGraph {
         self.fetch_initial_graph_data(cx);
     }
 
-    fn is_visible_ref_name(show_stashes: bool, show_tags: bool, ref_name: &str) -> bool {
+    fn is_visible_ref_name(
+        show_stashes: bool,
+        show_tags: bool,
+        show_remote_branches: bool,
+        ref_name: &str,
+    ) -> bool {
         if !show_tags && (ref_name.starts_with("tag: ") || ref_name.starts_with("refs/tags/")) {
+            return false;
+        }
+
+        if !show_remote_branches && Self::is_remote_branch_ref_name(ref_name) {
             return false;
         }
 
@@ -1584,6 +1595,10 @@ impl GitGraph {
         }
 
         true
+    }
+
+    fn is_remote_branch_ref_name(ref_name: &str) -> bool {
+        ref_name.starts_with("refs/remotes/")
     }
 
     /// Computes the height of a single commit row in the git graph.
@@ -3161,6 +3176,8 @@ impl GitGraph {
                 let filter_state = self.search_state.filter_matches;
                 let show_stashes = self.settings_dropdown_state.settings.show_stashes;
                 let show_tags = self.settings_dropdown_state.settings.show_tags;
+                let show_remote_branches =
+                    self.settings_dropdown_state.settings.show_remote_branches;
                 PopoverMenu::new("git-graph-filter")
                     .trigger(
                         IconButton::new("git-graph-filter-button", IconName::Filter)
@@ -3231,6 +3248,29 @@ impl GitGraph {
                                 },
                                 |window, cx| {
                                     window.dispatch_action(ToggleShowTags.boxed_clone(), cx);
+                                },
+                            )
+                            .custom_entry(
+                                move |_window: &mut Window, _cx: &mut App| {
+                                    Checkbox::new(
+                                        "git-graph-show-remote-branches",
+                                        if show_remote_branches {
+                                            ToggleState::Selected
+                                        } else {
+                                            ToggleState::Unselected
+                                        },
+                                    )
+                                    .label("Show Remote Branches")
+                                    .label_size(LabelSize::Small)
+                                    .label_color(Color::Default)
+                                    .visualization_only(true)
+                                    .into_any_element()
+                                },
+                                |window, cx| {
+                                    window.dispatch_action(
+                                        ToggleShowRemoteBranches.boxed_clone(),
+                                        cx,
+                                    );
                                 },
                             )
                         }))
@@ -3359,11 +3399,19 @@ impl GitGraph {
         let short_sha: SharedString = full_sha.chars().take(7).collect::<String>().into();
         let show_stashes = self.settings_dropdown_state.settings.show_stashes;
         let show_tags = self.settings_dropdown_state.settings.show_tags;
+        let show_remote_branches = self.settings_dropdown_state.settings.show_remote_branches;
         let ref_names: Vec<SharedString> = commit_entry
             .data
             .ref_names
             .iter()
-            .filter(|name| Self::is_visible_ref_name(show_stashes, show_tags, name.as_ref()))
+            .filter(|name| {
+                Self::is_visible_ref_name(
+                    show_stashes,
+                    show_tags,
+                    show_remote_branches,
+                    name.as_ref(),
+                )
+            })
             .cloned()
             .collect();
 
@@ -3933,6 +3981,7 @@ impl GitGraph {
 
         let show_stashes = self.settings_dropdown_state.settings.show_stashes;
         let show_tags = self.settings_dropdown_state.settings.show_tags;
+        let show_remote_branches = self.settings_dropdown_state.settings.show_remote_branches;
         let hovered_entry_idx = self.hovered_entry_idx;
         let selected_entry_idx = self.selected_entry_idx;
         let context_menu_target_index = self
@@ -4160,7 +4209,12 @@ impl GitGraph {
                         let commit_x = lane_center_x(bounds, commit.lane as f32);
 
                         if commit.data.ref_names.iter().any(|name| {
-                            Self::is_visible_ref_name(show_stashes, show_tags, name.as_ref())
+                            Self::is_visible_ref_name(
+                                show_stashes,
+                                show_tags,
+                                show_remote_branches,
+                                name.as_ref(),
+                            )
                         }) {
                             paint_dashed_connector(
                                 bounds.origin.x,
@@ -4298,6 +4352,7 @@ impl GitGraph {
                     Self::is_visible_ref_name(
                         self.settings_dropdown_state.settings.show_stashes,
                         self.settings_dropdown_state.settings.show_tags,
+                        self.settings_dropdown_state.settings.show_remote_branches,
                         name.as_ref(),
                     )
                 })
@@ -5089,6 +5144,14 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &ToggleShowTags, _window, cx| {
                 this.update_graph_settings(|settings| settings.show_tags ^= true, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &ToggleShowRemoteBranches, _window, cx| {
+                    this.update_graph_settings(
+                        |settings| settings.show_remote_branches ^= true,
+                        cx,
+                    );
+                }),
+            )
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))
             .on_action(cx.listener(|this, _: &SelectNextMatch, _window, cx| {
@@ -8945,5 +9008,14 @@ mod tests {
                 .map(|m| m.message.entity_id());
             assert_eq!(message_entity_id, new_entity_id);
         });
+    }
+
+    #[test]
+    fn test_remote_branch_ref_name_detection() {
+        assert!(GitGraph::is_remote_branch_ref_name(
+            "refs/remotes/origin/main"
+        ));
+        assert!(!GitGraph::is_remote_branch_ref_name("refs/heads/main"));
+        assert!(!GitGraph::is_remote_branch_ref_name("refs/tags/v1.0"));
     }
 }
