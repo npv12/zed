@@ -2471,11 +2471,14 @@ impl GitPanel {
     }
 
     pub fn stage_all(&mut self, _: &StageAll, window: &mut Window, cx: &mut Context<Self>) {
-        let has_conflicts = self.entries.iter().any(|entry| {
-            entry
-                .status_entry()
-                .is_some_and(|e| e.status.is_conflicted())
-        });
+        let has_conflicts = {
+            let cx: &App = cx;
+            self.entries.iter().any(|entry| {
+                entry
+                    .status_entry()
+                    .is_some_and(|e| self.git_entry_has_conflict_markers(e, cx))
+            })
+        };
         if has_conflicts {
             cx.spawn_in(window, async move |this, cx| {
                 let prompt = cx.prompt(
@@ -2637,6 +2640,35 @@ impl GitPanel {
         .detach();
     }
 
+    /// Checks whether a file's content actually contains unresolved merge
+    /// conflict markers (`<<<<<<< ` / `>>>>>>> `), as opposed to relying on
+    /// git's `FileStatus::is_conflicted()` which only reflects whether `git add`
+    /// has been run on the file.
+    fn git_entry_has_conflict_markers(&self, entry: &GitStatusEntry, cx: &App) -> bool {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return false;
+        };
+        let repo = repo.read(cx);
+        let abs_path = repo
+            .snapshot()
+            .work_directory_abs_path
+            .join(entry.repo_path.as_std_path());
+        match std::fs::read_to_string(&abs_path) {
+            Ok(content) => {
+                let mut in_conflict = false;
+                for line in content.lines() {
+                    if line.starts_with("<<<<<<< ") {
+                        in_conflict = true;
+                    } else if in_conflict && line.starts_with(">>>>>>> ") {
+                        return true;
+                    }
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
     fn change_file_stage_with_conflict_warning(
         &mut self,
         stage: bool,
@@ -2644,26 +2676,32 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if stage && entries.iter().any(|e| e.status.is_conflicted()) {
-            cx.spawn_in(window, async move |this, cx| {
-                let prompt = cx.prompt(
-                    PromptLevel::Warning,
-                    "Stage file with unresolved conflicts?",
-                    Some("This file still has merge conflicts that have not been resolved."),
-                    &["Stage", "Cancel"],
-                );
-                if prompt.await != Ok(0) {
-                    return;
-                }
-                this.update(cx, |this, cx| {
-                    this.change_file_stage(stage, entries, cx);
+        if stage {
+            let has_conflicts = {
+                let cx: &App = cx;
+                entries.iter().any(|e| self.git_entry_has_conflict_markers(e, cx))
+            };
+            if has_conflicts {
+                cx.spawn_in(window, async move |this, cx| {
+                    let prompt = cx.prompt(
+                        PromptLevel::Warning,
+                        "Stage file with unresolved conflicts?",
+                        Some("This file still has merge conflicts that have not been resolved."),
+                        &["Stage", "Cancel"],
+                    );
+                    if prompt.await != Ok(0) {
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        this.change_file_stage(stage, entries, cx);
+                    })
+                    .ok();
                 })
-                .ok();
-            })
-            .detach();
-        } else {
-            self.change_file_stage(stage, entries, cx);
+                .detach();
+                return;
+            }
         }
+        self.change_file_stage(stage, entries, cx);
     }
 
     pub fn total_staged_count(&self) -> usize {
