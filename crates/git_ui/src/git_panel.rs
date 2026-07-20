@@ -2228,6 +2228,36 @@ impl GitPanel {
         }
     }
 
+    fn open_file(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        maybe!({
+            let entry = self
+                .entries
+                .get(self.selected_entry?)?
+                .status_entry()?
+                .clone();
+            let repository = self.active_repository.clone()?;
+
+            let project_path = repository
+                .read(cx)
+                .repo_path_to_project_path(&entry.repo_path, cx)?;
+
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace
+                        .open_path(project_path, None, true, window, cx)
+                        .detach_and_log_err(cx);
+                })
+                .ok();
+
+            Some(())
+        });
+    }
+
     fn revert_selected(
         &mut self,
         action: &git::RestoreFile,
@@ -8027,6 +8057,36 @@ impl GitPanel {
                         stat.deleted as usize,
                     ))
                 })
+            })
+            .when(!is_deleted, |el| {
+                let this = cx.weak_entity();
+                el.child(
+                    div()
+                        .id(ElementId::Name(format!("open_file_{}", ix).into()))
+                        .flex_none()
+                        .occlude()
+                        .cursor_pointer()
+                        .child(
+                            IconButton::new(
+                                ElementId::Name(format!("open_btn_{}", ix).into()),
+                                IconName::ArrowUpRight,
+                            )
+                            .shape(ui::IconButtonShape::Square)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(|_window, cx| {
+                                Tooltip::for_action("Open File", &menu::SecondaryConfirm, cx)
+                            })
+                            .on_click(move |_, window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.selected_entry = Some(ix);
+                                    this.open_file(&Default::default(), window, cx);
+                                    cx.stop_propagation();
+                                })
+                                .ok();
+                            }),
+                        ),
+                )
             })
             .child(
                 div()
