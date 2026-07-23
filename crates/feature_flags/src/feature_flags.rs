@@ -128,7 +128,7 @@ pub trait FeatureFlag {
     /// This is generally done on the server, but we provide this as a way to entirely enable a feature flag client-side
     /// without needing to remove all of the call sites.
     fn enabled_for_all() -> bool {
-        false
+        true
     }
 
     /// Subscribes the current view to changes in the feature flag store, so
