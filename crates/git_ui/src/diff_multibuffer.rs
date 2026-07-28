@@ -277,6 +277,14 @@ impl DiffMultibuffer {
         }
     }
 
+    /// Sets a path to scroll to once it is registered in the multibuffer.
+    /// Unlike `move_to_path`, this skips the old-buffer lookup so callers
+    /// can defer navigation across an upcoming buffer rebuild (e.g. during
+    /// a diff base switch).
+    pub(crate) fn set_pending_scroll(&mut self, path_key: PathKey) {
+        self.pending_scroll = Some(path_key);
+    }
+
     pub(crate) fn autoscroll(&self, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {

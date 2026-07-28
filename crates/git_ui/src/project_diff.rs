@@ -1,5 +1,5 @@
 use crate::{
-    diff_multibuffer::DiffMultibuffer,
+    diff_multibuffer::{DiffMultibuffer, project_diff_path_key},
     git_panel::{GitPanel, GitPanelAddon, GitStatusEntry},
     staged_diff::StagedDiffDelegate,
     unstaged_diff::UnstagedDiffDelegate,
@@ -289,7 +289,23 @@ impl ProjectDiff {
         });
         self.current_base = base;
         if let Some(entry) = entry {
-            self.move_to_entry(entry, window, cx);
+            // Defer scroll to after the refresh (triggered by DiffBaseChanged):
+            // navigating via move_to_entry now would find stale positions in
+            // the (soon-to-be-replaced) old buffer content. Instead compute
+            // the path_key and enqueue it as pending_scroll; register_buffer
+            // in the refresh will apply it once the new content is loaded.
+            self.diff.update(cx, |diff, cx| {
+                if let Some(git_repo) = diff.branch_diff().read(cx).repo() {
+                    let repo = git_repo.read(cx);
+                    let path_key = project_diff_path_key(
+                        &repo,
+                        &entry.repo_path,
+                        entry.status,
+                        cx,
+                    );
+                    diff.set_pending_scroll(path_key);
+                }
+            });
         }
     }
 
